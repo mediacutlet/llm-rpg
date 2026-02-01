@@ -1224,16 +1224,33 @@ app.post('/api/summary/:charId', async (req, res) => {
     const world = await pool.query('SELECT tick FROM world WHERE id = 1');
     const tick = world.rows[0].tick;
     
-    // Get existing summaries
-    const rel = await pool.query(
+    // Get existing summaries (check both directions and merge)
+    const rel1 = await pool.query(
       'SELECT conversation_summaries FROM relationships WHERE char1_id = $1 AND char2_id = $2',
       [charId, otherId]
     );
+    const rel2 = await pool.query(
+      'SELECT conversation_summaries FROM relationships WHERE char1_id = $1 AND char2_id = $2',
+      [otherId, charId]
+    );
     
+    // Merge summaries from both directions
     let summaries = [];
-    if (rel.rows.length > 0 && rel.rows[0].conversation_summaries) {
-      summaries = rel.rows[0].conversation_summaries;
+    if (rel1.rows.length > 0 && rel1.rows[0].conversation_summaries) {
+      summaries = [...rel1.rows[0].conversation_summaries];
     }
+    if (rel2.rows.length > 0 && rel2.rows[0].conversation_summaries) {
+      // Add summaries from other direction if not already present (by tick)
+      const existingTicks = new Set(summaries.map(s => s.tick));
+      for (const s of rel2.rows[0].conversation_summaries) {
+        if (!existingTicks.has(s.tick)) {
+          summaries.push(s);
+        }
+      }
+    }
+    
+    // Sort by tick
+    summaries.sort((a, b) => a.tick - b.tick);
     
     // Add new summary
     summaries.push({
@@ -1249,13 +1266,20 @@ app.post('/api/summary/:charId', async (req, res) => {
       summaries = summaries.slice(-20);
     }
     
-    // Upsert relationship with new summaries
+    // Save to BOTH directions so both characters see the shared history
     await pool.query(`
       INSERT INTO relationships (char1_id, char2_id, conversation_summaries, first_met_tick, last_interaction_tick)
       VALUES ($1, $2, $3, $4, $4)
       ON CONFLICT (char1_id, char2_id) 
       DO UPDATE SET conversation_summaries = $3, last_interaction_tick = $4
     `, [charId, otherId, JSON.stringify(summaries), tick]);
+    
+    await pool.query(`
+      INSERT INTO relationships (char1_id, char2_id, conversation_summaries, first_met_tick, last_interaction_tick)
+      VALUES ($1, $2, $3, $4, $4)
+      ON CONFLICT (char1_id, char2_id) 
+      DO UPDATE SET conversation_summaries = $3, last_interaction_tick = $4
+    `, [otherId, charId, JSON.stringify(summaries), tick]);
     
     res.json({ success: true, summaryCount: summaries.length });
   } catch (err) {

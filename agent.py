@@ -591,6 +591,19 @@ Reply with ONLY: move {direction}"""
             other = nearby_chars[0]
             other_name = other["name"]
             other_id = other.get("id", other_name)
+            other_distance = other.get("distance", 10)
+            
+            # Must be adjacent (distance <= 1.5) to talk
+            if other_distance > 1.5:
+                # Too far to talk - approach them
+                directions = other.get("direction", valid_moves)
+                safe_directions = [d for d in directions if d in preferred_moves]
+                if not safe_directions:
+                    safe_directions = [d for d in directions if d in valid_moves]
+                if not safe_directions:
+                    safe_directions = preferred_moves if preferred_moves else valid_moves
+                best_direction = safe_directions[0] if safe_directions else 'south'
+                return None, f"direct_move_{best_direction}", None
             
             # Check if we're in goodbye cooldown with this person
             if other_id in self.goodbye_cooldown:
@@ -631,19 +644,57 @@ Reply with ONLY: move {self.traveling_direction}"""
             current_tick = int(state.get("world", {}).get("tick", 0) or 0)
             ticks_since_last_convo = current_tick - last_convo_tick if last_convo_tick > 0 else 999
             
-            # Find what they JUST said to us (must be very recent - within last 3 ticks)
+            # Find what they JUST said to us (check recent messages)
             last_said_to_me = None
             last_said_tick = 0
             for c in reversed(recent_convos):
                 if c.get("listener_id") == self.char_id:
                     msg_tick = int(c.get("tick", 0) or 0)
-                    # Only consider messages from the last 3 ticks as "just said"
-                    if current_tick - msg_tick <= 3:
+                    # Consider messages from the last 10 ticks
+                    if current_tick - msg_tick <= 10:
                         last_said_to_me = c.get("message")
                         last_said_tick = msg_tick
                     break
             
             # Check if they said goodbye RECENTLY - we should acknowledge and leave too
+            goodbye_phrases = ['goodbye', 'farewell', 'adieu', 'bye', 'see you', 'until next', 'take care', 'been delightful', 'bid you', 'should go', 'must go', 'heading off']
+            
+            # Check if THEY said goodbye at all recently (even if not directly to us)
+            they_said_goodbye = False
+            they_goodbye_tick = 0
+            for c in reversed(recent_convos[-15:]):
+                if c.get("speaker_name") == other_name:
+                    if any(phrase in c.get("message", "").lower() for phrase in goodbye_phrases):
+                        they_said_goodbye = True
+                        they_goodbye_tick = int(c.get("tick", 0) or 0)
+                        break
+            
+            # If they said goodbye recently, set cooldown and leave
+            if they_said_goodbye and current_tick - they_goodbye_tick < 30:
+                # Check if we already acknowledged
+                we_acknowledged = False
+                for c in reversed(recent_convos[-10:]):
+                    if c.get("speaker_id") == self.char_id:
+                        c_tick = int(c.get("tick", 0) or 0)
+                        if c_tick > they_goodbye_tick:
+                            if any(phrase in c.get("message", "").lower() for phrase in goodbye_phrases):
+                                we_acknowledged = True
+                        break
+                
+                if we_acknowledged:
+                    # Already said goodbye back, just set cooldown and move away
+                    self.goodbye_cooldown[other_id] = 30
+                    if not self.traveling_direction or self.traveling_direction not in valid_moves:
+                        if valid_moves:
+                            self.traveling_direction = random.choice(valid_moves)
+                    return None, f"direct_move_{self.traveling_direction or 'south'}", None
+                else:
+                    # Need to say goodbye back
+                    prompt = f"""You are {self.name}.
+{other_name} said goodbye to you. Acknowledge and say a brief farewell.
+One short sentence - use "goodbye", "farewell", or "take care":"""
+                    return prompt, "goodbye", other_id
+            
             if last_said_to_me:
                 goodbye_phrases = ['goodbye', 'farewell', 'adieu', 'bye', 'see you', 'until next', 'take care', 'been delightful', 'bid you', 'should go', 'must go', 'heading off']
                 said_goodbye = any(phrase in last_said_to_me.lower() for phrase in goodbye_phrases)
@@ -810,22 +861,12 @@ Go AWAY from them - try: {', '.join(avoid_directions)}
 ✅ Valid moves: {', '.join(valid_moves)}
 
 Reply with ONLY: move {avoid_directions[0] if avoid_directions else 'south'}"""
-                return prompt, "move", None
+                # Use direct move to avoid LLM ignoring our direction
+                return None, f"direct_move_{avoid_directions[0] if avoid_directions else 'south'}", None
             
             best_direction = safe_directions[0] if safe_directions else 'south'
-            prompt = f"""You are {self.name}, exploring the world. You see {other['name']} in the distance!
-{text_desc}
-
-🎯 GOAL: Go meet {other['name']}!
-📍 They are to the {' and '.join(directions)} of you.
-✅ Valid moves: {', '.join(valid_moves)}
-🚫 Recently blocked: {', '.join(self.blocked_directions.keys()) if self.blocked_directions else 'none'}
-
-To reach them, move {best_direction.upper()} now!
-
-Reply with ONLY: move {best_direction}"""
-            
-            return prompt, "move", None
+            # Skip LLM for simple approach - just move directly
+            return None, f"direct_move_{best_direction}", None
         
         else:
             time_note = "🌙 It's night time. The world is quiet." if is_night else ""
@@ -907,6 +948,11 @@ Reply with ONLY one of: move north | move south | move east | move west"""
         elif expected_type == "eat":
             # Parse interact command for eating at market
             return "interact", {"target": "market"}
+        
+        elif expected_type.startswith("direct_move_"):
+            # Direct movement - no LLM needed, just use the specified direction
+            direction = expected_type.replace("direct_move_", "")
+            return "move", {"direction": direction}
         
         else:
             response_lower = response.lower()
@@ -994,10 +1040,15 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         print(f"   👁️ See {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining}) memories={sum_count}")
                 
                 print(f"🤔 Thinking... (mode: {expected_type})")
-                response = ollama_generate(prompt, self.model)
                 
-                # Parse and execute
-                action, params = self.parse_response(response, expected_type)
+                # Handle direct actions (no LLM needed)
+                if prompt is None and expected_type.startswith("direct_move_"):
+                    action, params = self.parse_response("", expected_type)
+                    response = f"[direct: {params.get('direction')}]"
+                else:
+                    response = ollama_generate(prompt, self.model)
+                    # Parse and execute
+                    action, params = self.parse_response(response, expected_type)
                 
                 if action == "talk":
                     message = params["message"]

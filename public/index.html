@@ -121,7 +121,7 @@
     .leaderboard li:nth-child(3) { background: rgba(205, 127, 50, 0.1); }
     
     .rank { font-weight: bold; color: #888; width: 20px; }
-    .char-emoji { font-size: 1.5rem; }
+    .char-emoji { font-size: 1.5rem; position: relative; }
     .char-info { flex: 1; }
     .char-name { font-weight: 600; }
     .char-stats { font-size: 0.75rem; color: #888; }
@@ -132,6 +132,23 @@
       border-radius: 10px;
       font-size: 0.75rem;
       font-weight: bold;
+    }
+    
+    .online-dot, .offline-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-left: -8px;
+      margin-bottom: -2px;
+      vertical-align: bottom;
+    }
+    .online-dot {
+      background: #2ecc71;
+      box-shadow: 0 0 6px #2ecc71;
+    }
+    .offline-dot {
+      background: #555;
     }
     
     .conversation-list { max-height: 300px; overflow-y: auto; }
@@ -304,6 +321,7 @@
     function renderLeaderboard() {
       const list = document.getElementById('leaderboard');
       const sorted = [...worldData.characters].sort((a, b) => b.xp - a.xp);
+      const currentTick = worldData.world?.tick || 0;
       
       list.innerHTML = sorted.length === 0 
         ? '<li style="color:#666;justify-content:center;">No characters yet</li>'
@@ -312,10 +330,18 @@
           const maxEnergy = char.max_energy || 100;
           const energyPercent = (energy / maxEnergy) * 100;
           const energyColor = energyPercent > 50 ? '#2ecc71' : energyPercent > 20 ? '#f39c12' : '#e74c3c';
+          
+          // Check if online (acted within last 10 ticks)
+          const lastAction = char.last_action_tick || 0;
+          const isOnline = (currentTick - lastAction) < 10;
+          const onlineIndicator = isOnline 
+            ? '<span class="online-dot" title="Online"></span>' 
+            : '<span class="offline-dot" title="Offline"></span>';
+          
           return `
           <li>
             <span class="rank">${i + 1}</span>
-            <span class="char-emoji">${char.emoji}</span>
+            <span class="char-emoji">${char.emoji}${onlineIndicator}</span>
             <div class="char-info">
               <div class="char-name">${char.name}</div>
               <div class="char-stats">
@@ -356,7 +382,41 @@
         container.innerHTML = '<p style="color:#666;">No activity yet...</p>';
         return;
       }
-      container.innerHTML = worldData.activity.slice(0, 20).map(a => `
+      
+      // Process activity to condense conversations
+      const processed = worldData.activity.slice(0, 30).map(a => {
+        // Check if it's a conversation message
+        if (a.action === 'talk' && a.message.includes('says to')) {
+          // Extract names from "X says to Y: ..."
+          const match = a.message.match(/^(.+?) says to (.+?):/);
+          if (match) {
+            return {
+              ...a,
+              message: `💬 ${match[1]} chatting with ${match[2]}`,
+              isConvo: true
+            };
+          }
+        }
+        return { ...a, isConvo: false };
+      });
+      
+      // Dedupe consecutive conversations between same pair
+      const deduped = [];
+      let lastConvoPair = null;
+      for (const a of processed) {
+        if (a.isConvo) {
+          const pair = a.message;
+          if (pair !== lastConvoPair) {
+            deduped.push(a);
+            lastConvoPair = pair;
+          }
+        } else {
+          deduped.push(a);
+          lastConvoPair = null;
+        }
+      }
+      
+      container.innerHTML = deduped.slice(0, 20).map(a => `
         <div class="activity">
           <span class="activity-tick">${a.tick}</span>
           <span>${a.emoji || ''} ${a.message}</span>

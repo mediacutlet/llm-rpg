@@ -329,6 +329,29 @@ TOPICS: [topic1, topic2, topic3]"""
         food_spots = state.get("foodSpotsNearby", [])
         is_night = state.get("world", {}).get("isNight", False)
         
+        # Environmental context
+        current_location = state.get("currentLocation", "open meadow")
+        nearby_objects = state.get("nearbyObjects", [])
+        world_events = state.get("recentWorldEvents", [])
+        
+        # Build environment description
+        env_context = ""
+        if current_location and current_location != "open meadow":
+            env_context = f"You are at: {current_location}. "
+        
+        # Add nearby notable features
+        notable_features = [o.get("name") for o in nearby_objects[:3] if o.get("distance", 10) <= 3]
+        if notable_features:
+            env_context += f"Nearby: {', '.join(notable_features)}. "
+        
+        # Add time of day
+        if is_night:
+            env_context += "It's nighttime. "
+        
+        # Add recent world events
+        if world_events:
+            env_context += f"[{world_events[0]}] "
+        
         # Get energy and hunger info
         char_data = state.get("character", {})
         energy = char_data.get("energy", 100)
@@ -635,10 +658,56 @@ Reply with ONLY: move {direction}"""
                     del self.last_talked_tick[char_id]
         
         if can_talk and nearby_chars:
-            other = nearby_chars[0]
+            # First, check if anyone nearby JUST said something to us - prioritize responding to them
+            current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+            current_time = time.time()
+            speaker_to_respond_to = None
+            they_just_spoke_to_us = False
+            their_message_tick = 0
+            
+            for c in reversed(recent_convos[-10:]):
+                if c.get("listener_id") == self.char_id:
+                    speaker_id = c.get("speaker_id")
+                    msg_tick = int(c.get("tick", 0) or 0)
+                    # Someone spoke to us in the last 10 ticks
+                    if current_tick - msg_tick <= 10:
+                        # Check if this speaker is nearby
+                        for nearby in nearby_chars:
+                            if nearby.get("id") == speaker_id:
+                                speaker_to_respond_to = nearby
+                                they_just_spoke_to_us = True
+                                their_message_tick = msg_tick
+                                break
+                    break
+            
+            # If someone just spoke to us, respond to THEM (not just the first nearby character)
+            if speaker_to_respond_to:
+                other = speaker_to_respond_to
+            else:
+                # Find first nearby character NOT in cooldown AND online
+                other = None
+                current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+                for nc in nearby_chars:
+                    nc_id = nc.get("id", nc["name"])
+                    if nc_id in self.goodbye_cooldown:
+                        continue
+                    # Check if they're online (acted in last 10 ticks)
+                    nc_last_action = int(nc.get("last_action_tick", 0) or 0)
+                    if current_tick - nc_last_action > 10:
+                        continue  # Skip offline characters
+                    other = nc
+                    break
+                
+                # If no one is online and not in cooldown, just move around
+                if other is None:
+                    return None, "move", None
+                
             other_name = other["name"]
             other_id = other.get("id", other_name)
             other_distance = other.get("distance", 10)
+            
+            # No turn-taking needed - cooldowns handle conversation flow
+            # If we're here, we can talk to them (not in cooldown)
             
             # Must be adjacent (distance <= 1.5) to talk
             if other_distance > 1.5:
@@ -651,6 +720,61 @@ Reply with ONLY: move {direction}"""
                     safe_directions = preferred_moves if preferred_moves else valid_moves
                 best_direction = safe_directions[0] if safe_directions else 'south'
                 return None, f"direct_move_{best_direction}", None
+            
+            # PROPER TURN-TAKING using local state
+            # Track: did we send a message that hasn't been responded to yet?
+            
+            # Check server for their most recent message TO US
+            their_last_to_us = 0
+            for c in reversed(recent_convos[-20:]):
+                if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
+                    their_last_to_us = int(c.get("tick", 0) or 0)
+                    break
+            
+            # Check if we're waiting for this person to respond
+            waiting_since = self.last_talked_tick.get(f"waiting_{other_id}", 0)
+            
+            if waiting_since > 0:
+                # We're waiting - check if they responded
+                if their_last_to_us > waiting_since:
+                    # They responded! Clear waiting state
+                    print(f"   ✅ {other_name} responded at tick {their_last_to_us}")
+                    self.last_talked_tick[f"waiting_{other_id}"] = 0
+                else:
+                    # Still waiting
+                    ticks_waiting = current_tick - waiting_since
+                    if ticks_waiting < 10:
+                        print(f"   ⏳ Waiting for {other_name}'s response (sent at tick {waiting_since}, now {current_tick})")
+                        time.sleep(3)
+                        return None, "skip", None
+                    else:
+                        # Timeout
+                        print(f"   😤 {other_name} not responding after {ticks_waiting} ticks")
+                        self.last_talked_tick[f"waiting_{other_id}"] = 0
+                        self.goodbye_cooldown[other_id] = 30
+                        prompt = f"""You are {self.name}. {other_name} isn't responding.
+Say a brief goodbye. One sentence:"""
+                        return prompt, "goodbye", other_id
+            
+            # Not waiting - but should we initiate?
+            # TIE-BREAKER: Higher ID never initiates, always waits for lower ID
+            # EXCEPTION: If they're OFFLINE (haven't acted in 10 ticks), we can initiate
+            if their_last_to_us == 0 or current_tick - their_last_to_us > 20:
+                # They haven't spoken to us recently - this is a new conversation
+                if self.char_id > other_id:
+                    # Check if they're online (acted recently)
+                    other_last_action = int(other.get("last_action_tick", 0) or 0)
+                    is_online = current_tick - other_last_action <= 10
+                    
+                    if is_online:
+                        print(f"   ⏳ Letting {other_name} initiate (they have lower ID)")
+                        time.sleep(2)
+                        return None, "skip", None
+                    else:
+                        # They're offline - skip them and look for someone else
+                        print(f"   💤 {other_name} is idle (last action tick {other_last_action})")
+                        # Move on to find someone else
+                        return None, "move", None
             
             # Check if we're in goodbye cooldown with this person
             if other_id in self.goodbye_cooldown:
@@ -796,28 +920,18 @@ Say goodbye warmly. Use phrases like "goodbye", "farewell", "I should go explore
             
             if should_greet:
                 if have_met_before:
-                    # We've met before - include memory context
-                    memory_hint = ""
-                    if past_summaries:
-                        last_topic = past_summaries[-1].get("title", "")
-                        memory_hint = f"\nYou remember last time you talked about: {last_topic}"
-                    
-                    prompt = f"""You are {self.name}, greeting {other_name}.
-Personality: {self.personality[:300]}
+                    prompt = f"""You are {self.name}. You see your friend {other_name}.
 {memory_context}
-You see {other_name}, whom you've talked to before!{memory_hint}
 
-Speak directly as {self.name} in first person. Greet them warmly in 1-2 sentences:
+Say hi! ONE casual sentence - like meeting a friend:
 
-{self.name} says:"""
+{self.name}:"""
                 else:
-                    # First time meeting - introduce yourself
-                    prompt = f"""You are {self.name}, meeting {other_name} for the first time.
-Personality: {self.personality[:300]}
+                    prompt = f"""You are {self.name}. You meet {other_name} for the first time.
 
-Speak directly as {self.name} in first person. Introduce yourself warmly in 1-2 sentences:
+Introduce yourself casually in ONE sentence:
 
-{self.name} says:"""
+{self.name}:"""
                 return prompt, "talk", other_id
             
             # Get topics we've covered to suggest variety
@@ -842,35 +956,24 @@ Speak directly as {self.name} in first person. Introduce yourself warmly in 1-2 
                 
                 repetition_warning = ""
                 if our_last:
-                    repetition_warning = f'\n⚠️ You already said: "{our_last}..." - DO NOT repeat this!'
+                    repetition_warning = f'\n⚠️ You already said: "{our_last}..." - say something DIFFERENT!'
                 
-                prompt = f"""You are {self.name}, speaking directly to {other_name}.
-Personality: {self.personality[:300]}
-{memory_context if memory_context else ""}
-{convo_history}
+                prompt = f"""You are {self.name} chatting with {other_name}.
 
-{other_name} just said to you: "{last_said_to_me[:300]}"
+They said: "{last_said_to_me[:150]}"
 {repetition_warning}
 
-RESPOND AS {self.name.upper()} - speak in FIRST PERSON ("I", "me", "my").
-DO NOT narrate or describe actions. Just say what you would say out loud.
-{"ANSWER THEIR QUESTION!" if asked_question else "React to what they said."}
-Keep it to 2-3 sentences.
+Respond naturally in 1-2 sentences. Focus on THEM, not the scenery.
+{"Answer their question." if asked_question else "React to what they said or ask them something."}
 
-{self.name} says:"""
+{self.name}:"""
             else:
-                prompt = f"""You are {self.name}, speaking directly to {other_name}.
-Personality: {self.personality[:300]}
-{memory_context if memory_context else ""}
-{convo_history}
+                prompt = f"""You are {self.name} chatting with {other_name}.
 
-You see {other_name}. {"Continue your conversation." if convo_history else "Greet them!"}
+Keep the conversation going! Ask them a question or share something about yourself.
+1-2 sentences only. Focus on THEM, not surroundings.
 
-RESPOND AS {self.name.upper()} - speak in FIRST PERSON ("I", "me", "my").
-DO NOT narrate or describe actions. Just say what you would say out loud.
-Keep it to 2-3 sentences.
-
-{self.name} says:"""
+{self.name}:"""
             
             return prompt, "talk", other_id
         
@@ -964,10 +1067,14 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             # Clean up extra whitespace
             message = re.sub(r'\s+', ' ', message).strip()
             
-            # Truncate if way too long (model went on a monologue)
-            sentences = message.split('. ')
-            if len(sentences) > 4:
-                message = '. '.join(sentences[:4]) + '.'
+            # Truncate aggressively - max 2 sentences for natural dialogue
+            sentences = re.split(r'(?<=[.!?])\s+', message)
+            if len(sentences) > 2:
+                message = ' '.join(sentences[:2])
+            
+            # Also cap by character length
+            if len(message) > 200:
+                message = message[:200].rsplit(' ', 1)[0] + '...'
             
             return "talk", {"message": message or "Hello!"}
         
@@ -1089,7 +1196,10 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 print(f"🤔 Thinking... (mode: {expected_type})")
                 
                 # Handle direct actions (no LLM needed)
-                if prompt is None and expected_type.startswith("direct_move_"):
+                if prompt is None and expected_type == "skip":
+                    # Waiting for response - skip this turn
+                    continue
+                elif prompt is None and expected_type.startswith("direct_move_"):
                     action, params = self.parse_response("", expected_type)
                     response = f"[direct: {params.get('direction')}]"
                 elif prompt is None and expected_type == "rest":
@@ -1109,8 +1219,16 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     message = params["message"]
                     is_goodbye = params.get("is_goodbye", False)
                     
+                    # Set waiting state - we spoke, now wait for their response
+                    if talk_target_id and not is_goodbye:
+                        current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+                        self.last_talked_tick[f"waiting_{talk_target_id}"] = current_tick
+                    
                     if is_goodbye:
                         print(f'👋 "{message}"')
+                        # Clear waiting state
+                        if talk_target_id:
+                            self.last_talked_tick[f"waiting_{talk_target_id}"] = 0
                         # Set flag to force movement on next turn
                         self.must_leave = True
                         self.leaving_from = talk_target_id

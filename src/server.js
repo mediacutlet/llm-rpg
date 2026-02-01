@@ -594,7 +594,7 @@ app.get('/api/look/:charId', async (req, res) => {
     
     // Get nearby characters (within 10 tiles)
     const others = await pool.query(`
-      SELECT id, name, emoji, x, y, hp, xp, level
+      SELECT id, name, emoji, x, y, hp, xp, level, last_action_tick
       FROM characters
       WHERE id != $1 AND is_active = true
         AND ABS(x - $2) <= 10 AND ABS(y - $3) <= 10
@@ -747,9 +747,22 @@ app.get('/api/look/:charId', async (req, res) => {
       direction: getMoveToward(r.x - me.x, r.y - me.y)
     }));
     
+    // Get current tile info
+    const currentTile = objects.rows.find(o => o.x === me.x && o.y === me.y);
+    const currentLocation = currentTile ? currentTile.name : 'open meadow';
+    
+    // Get recent world events (last 5 ticks)
+    const worldTick = world.rows[0]?.tick || 0;
+    const recentEvents = await pool.query(`
+      SELECT tick, message FROM activity 
+      WHERE action = 'world_event' AND tick > $1 - 5
+      ORDER BY tick DESC LIMIT 3
+    `, [worldTick]);
+    
     res.json({
       character: { ...me, energy, maxEnergy, hunger, maxHunger },
       world: { ...world.rows[0], isNight },
+      currentLocation,
       nearbyCharacters: nearbyChars.map(c => ({
         ...c,
         conversationFatigue: fatigueMap[c.id] || { exchanges: 0, cooldownUntil: 0, summaries: [] }
@@ -757,6 +770,7 @@ app.get('/api/look/:charId', async (req, res) => {
       nearbyObjects: nearbyObjs,
       restSpotsNearby: restSpots,
       foodSpotsNearby: foodSpots,
+      recentWorldEvents: recentEvents.rows.map(e => e.message),
       memories: memories.rows,
       recentConversations: convos.rows,
       canAct: actAllowed,

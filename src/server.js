@@ -167,28 +167,73 @@ async function worldTick() {
     const result = await pool.query(`
       UPDATE world SET tick = tick + 1, last_tick_at = NOW()
       WHERE id = 1
-      RETURNING tick
+      RETURNING tick, is_night, day_length, night_length
     `);
-    const tick = result.rows[0].tick;
+    const { tick, is_night, day_length, night_length } = result.rows[0];
+    const cycleLength = (day_length || 200) + (night_length || 50);
+    const cyclePosition = tick % cycleLength;
+    
+    // Check for day/night transition
+    const shouldBeNight = cyclePosition >= (day_length || 200);
+    if (shouldBeNight !== (is_night || false)) {
+      await pool.query('UPDATE world SET is_night = $1 WHERE id = 1', [shouldBeNight]);
+      
+      const transitionMsg = shouldBeNight 
+        ? '🌙 Night falls over the meadow. The world grows quiet...'
+        : '☀️ Dawn breaks! A new day begins in the meadow.';
+      
+      await pool.query(
+        'INSERT INTO activity_log (tick, action, message) VALUES ($1, $2, $3)',
+        [tick, 'world_event', transitionMsg]
+      );
+      broadcast('day_night', { tick, isNight: shouldBeNight, message: transitionMsg });
+    }
     
     // Broadcast tick to viewers
-    broadcast('tick', { tick, timestamp: new Date().toISOString() });
+    broadcast('tick', { tick, timestamp: new Date().toISOString(), isNight: shouldBeNight });
     
-    // Every 100 ticks, log a world event
+    // Every 10 ticks, regenerate a bit of energy for resting characters
+    if (tick % 10 === 0) {
+      await pool.query(`
+        UPDATE characters 
+        SET energy = LEAST(max_energy, energy + 5)
+        WHERE last_action_tick < $1 - 20
+      `, [tick]); // Regen for idle characters
+    }
+    
+    // Every 50 ticks, decay conversation cooldowns
+    if (tick % 50 === 0) {
+      await pool.query(`
+        UPDATE relationships 
+        SET recent_exchanges = GREATEST(0, recent_exchanges - 3)
+        WHERE recent_exchanges > 0
+      `);
+    }
+    
+    // World events
     if (tick % 100 === 0) {
-      const events = [
+      const dayEvents = [
         'A gentle breeze blows through the meadow.',
         'Birds sing in the distance.',
         'The sun shifts in the sky.',
         'A butterfly flutters past.',
         'Leaves rustle softly.'
       ];
+      const nightEvents = [
+        'An owl hoots in the distance.',
+        'Fireflies dance through the darkness.',
+        'The stars twinkle overhead.',
+        'A cool breeze whispers through the trees.',
+        'The moon casts long shadows.'
+      ];
+      const events = shouldBeNight ? nightEvents : dayEvents;
       const event = events[Math.floor(Math.random() * events.length)];
       await pool.query(
         'INSERT INTO activity_log (tick, action, message) VALUES ($1, $2, $3)',
         [tick, 'world_event', event]
       );
       broadcast('event', { tick, message: event });
+    }
     }
     
   } catch (err) {
@@ -336,6 +381,16 @@ app.post('/api/register', async (req, res) => {
       return res.status(400).json({ error: 'Personality description is required (at least 10 characters)' });
     }
     
+    // Check for duplicate name
+    const existing = await pool.query(
+      'SELECT id FROM characters WHERE LOWER(name) = LOWER($1)',
+      [name.trim()]
+    );
+    
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'A character with this name already exists. Please choose a different name.' });
+    }
+    
     const id = name.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 30) + '-' + uuidv4().slice(0, 8);
     const token = uuidv4();
     
@@ -407,7 +462,22 @@ app.get('/api/look/:charId', async (req, res) => {
     
     const me = char.rows[0];
     const world = await pool.query('SELECT * FROM world WHERE id = 1');
-    const { width, height, tick } = world.rows[0];
+    const { width, height, tick, is_night, day_length, night_length } = world.rows[0];
+    const isNight = is_night || false;
+    
+    // Get conversation fatigue info for nearby characters
+    const fatigueInfo = await pool.query(`
+      SELECT char2_id, recent_exchanges, cooldown_until_tick 
+      FROM relationships 
+      WHERE char1_id = $1
+    `, [charId]);
+    const fatigueMap = {};
+    fatigueInfo.rows.forEach(r => {
+      fatigueMap[r.char2_id] = { 
+        exchanges: r.recent_exchanges || 0, 
+        cooldownUntil: r.cooldown_until_tick || 0 
+      };
+    });
     
     // Get nearby characters (within 10 tiles)
     const others = await pool.query(`
@@ -441,9 +511,17 @@ app.get('/api/look/:charId', async (req, res) => {
     `, [charId]);
     
     // Build output similar to local version
+    const energy = me.energy || 100;
+    const maxEnergy = me.max_energy || 100;
+    
     let output = `[${me.name} at position ${me.x},${me.y}]\n`;
     output += `HP: ${me.hp}/${me.max_hp} | XP: ${me.xp} | Level: ${me.level}\n`;
-    output += `World tick: ${tick}\n\n`;
+    output += `⚡ Energy: ${energy}/${maxEnergy}${energy < 30 ? ' ⚠️ LOW - find a campfire or cottage to rest!' : ''}\n`;
+    output += `World tick: ${tick} | ${isNight ? '🌙 NIGHT' : '☀️ DAY'}\n\n`;
+    
+    if (isNight) {
+      output += '🌙 It is night time. The world is quieter.\n\n';
+    }
     
     // Boundaries
     const blocked = [];
@@ -467,10 +545,20 @@ app.get('/api/look/:charId', async (req, res) => {
     if (nearbyChars.length > 0) {
       output += '👥 OTHER CHARACTERS:\n';
       for (const other of nearbyChars) {
+        const fatigue = fatigueMap[other.id] || { exchanges: 0, cooldownUntil: 0 };
+        let fatigueNote = '';
+        if (fatigue.cooldownUntil > tick) {
+          fatigueNote = ' [⏳ Taking a break from chatting]';
+        } else if (fatigue.exchanges >= 10) {
+          fatigueNote = ' [😴 Conversation getting stale]';
+        } else if (fatigue.exchanges >= 5) {
+          fatigueNote = ' [💤 Talked a bit already]';
+        }
+        
         if (other.distance < 1.5) {
-          output += `  ${other.emoji} ${other.name} - RIGHT NEXT TO YOU! You can TALK!\n`;
+          output += `  ${other.emoji} ${other.name} - RIGHT NEXT TO YOU! You can TALK!${fatigueNote}\n`;
         } else if (other.distance < 3) {
-          output += `  ${other.emoji} ${other.name} - nearby (${Math.round(other.distance)} tiles). Move ${other.direction.join(' or ')} to approach.\n`;
+          output += `  ${other.emoji} ${other.name} - nearby (${Math.round(other.distance)} tiles). Move ${other.direction.join(' or ')} to approach.${fatigueNote}\n`;
         } else {
           output += `  ${other.emoji} ${other.name} - in the distance (${Math.round(other.distance)} tiles). Move ${other.direction.join(' or ')} to approach.\n`;
         }
@@ -489,7 +577,11 @@ app.get('/api/look/:charId', async (req, res) => {
       for (const obj of nearbyObjs.slice(0, 5)) {
         const dir = getDirection(obj.x - me.x, obj.y - me.y);
         const dist = obj.distance < 1 ? 'here' : `${dir} (${Math.round(obj.distance)} tiles)`;
-        output += `  ${obj.emoji} ${obj.name} - ${dist}\n`;
+        const isRestSpot = obj.name.toLowerCase().includes('campfire') || 
+                          obj.name.toLowerCase().includes('cottage') ||
+                          obj.name.toLowerCase().includes('pond');
+        const restNote = isRestSpot ? ' 💤 [Can rest here to recover energy]' : '';
+        output += `  ${obj.emoji} ${obj.name} - ${dist}${restNote}\n`;
       }
       output += '\n';
     }
@@ -507,15 +599,27 @@ app.get('/api/look/:charId', async (req, res) => {
     // Check if can act
     const actAllowed = await canAct(charId);
     
+    // Find rest spots nearby
+    const restSpots = nearbyObjs.filter(o => 
+      o.name.toLowerCase().includes('campfire') || 
+      o.name.toLowerCase().includes('cottage') ||
+      o.name.toLowerCase().includes('pond')
+    );
+    
     res.json({
-      character: me,
-      world: world.rows[0],
-      nearbyCharacters: nearbyChars,
+      character: { ...me, energy, maxEnergy },
+      world: { ...world.rows[0], isNight },
+      nearbyCharacters: nearbyChars.map(c => ({
+        ...c,
+        conversationFatigue: fatigueMap[c.id] || { exchanges: 0, cooldownUntil: 0 }
+      })),
       nearbyObjects: nearbyObjs,
+      restSpotsNearby: restSpots.map(r => ({ name: r.name, distance: r.distance })),
       memories: memories.rows,
       recentConversations: convos.rows,
       canAct: actAllowed,
       canTalk,
+      needsRest: energy < 30,
       validMoves: open,
       blockedMoves: blocked,
       textDescription: output
@@ -611,6 +715,17 @@ app.post('/api/action/:charId', async (req, res) => {
           return res.status(400).json({ error: 'Message is required' });
         }
         
+        // Check energy
+        const currentEnergy = me.energy || 100;
+        const energyCost = 3;
+        if (currentEnergy < energyCost) {
+          return res.status(400).json({ 
+            error: 'Too tired to talk. Rest at a campfire or cottage to recover energy.',
+            energy: currentEnergy,
+            needRest: true
+          });
+        }
+        
         // Find nearby character to talk to
         const nearby = await pool.query(`
           SELECT id, name FROM characters
@@ -625,6 +740,34 @@ app.post('/api/action/:charId', async (req, res) => {
         }
         
         const listener = nearby.rows[0];
+        
+        // Check conversation fatigue/cooldown
+        const relCheck = await pool.query(`
+          SELECT recent_exchanges, cooldown_until_tick 
+          FROM relationships 
+          WHERE char1_id = $1 AND char2_id = $2
+        `, [charId, listener.id]);
+        
+        let recentExchanges = 0;
+        let cooldownUntil = 0;
+        
+        if (relCheck.rows.length > 0) {
+          recentExchanges = relCheck.rows[0].recent_exchanges || 0;
+          cooldownUntil = relCheck.rows[0].cooldown_until_tick || 0;
+        }
+        
+        // Check if in cooldown
+        if (cooldownUntil > tick) {
+          const ticksLeft = cooldownUntil - tick;
+          return res.status(400).json({ 
+            error: `You've talked with ${listener.name} a lot recently. Take a break and explore! (${ticksLeft} ticks until you can chat again)`,
+            conversationFatigue: true,
+            cooldownTicks: ticksLeft
+          });
+        }
+        
+        // Deduct energy
+        await pool.query('UPDATE characters SET energy = energy - $1 WHERE id = $2', [energyCost, charId]);
         
         await pool.query(
           'INSERT INTO conversations (tick, speaker_id, listener_id, message) VALUES ($1, $2, $3, $4)',
@@ -641,22 +784,28 @@ app.post('/api/action/:charId', async (req, res) => {
           [listener.id, tick, `${me.name} said to me: "${message.slice(0, 200)}"`]
         );
         
-        // Update relationship
+        // Update relationship with exchange tracking
         const existingRel = await pool.query(
           'SELECT * FROM relationships WHERE char1_id = $1 AND char2_id = $2',
           [charId, listener.id]
         );
         
         const isFirstMeeting = existingRel.rows.length === 0;
+        const newExchangeCount = recentExchanges + 1;
+        
+        // Calculate cooldown - after 15 exchanges, enforce 30-tick break
+        const newCooldown = newExchangeCount >= 15 ? tick + 30 : 0;
         
         await pool.query(`
-          INSERT INTO relationships (char1_id, char2_id, sentiment, interactions, first_met_tick, last_interaction_tick)
-          VALUES ($1, $2, 5, 1, $3, $3)
+          INSERT INTO relationships (char1_id, char2_id, sentiment, interactions, first_met_tick, last_interaction_tick, recent_exchanges, cooldown_until_tick)
+          VALUES ($1, $2, 5, 1, $3, $3, 1, 0)
           ON CONFLICT (char1_id, char2_id) 
           DO UPDATE SET interactions = relationships.interactions + 1, 
                         sentiment = LEAST(100, relationships.sentiment + 1),
-                        last_interaction_tick = $3
-        `, [charId, listener.id, tick]);
+                        last_interaction_tick = $3,
+                        recent_exchanges = $4,
+                        cooldown_until_tick = $5
+        `, [charId, listener.id, tick, newExchangeCount, newCooldown]);
         
         // Record significant moment if first meeting
         if (isFirstMeeting) {
@@ -664,9 +813,20 @@ app.post('/api/action/:charId', async (req, res) => {
           await addSignificantMoment(listener.id, MOMENT_TRIGGERS.first_meeting(me.name), 'social');
         }
         
-        // XP for social interaction (bonus for first meeting)
-        const xpReward = isFirstMeeting ? XP_REWARDS.first_meeting : XP_REWARDS.talk;
-        const xpResult = await awardXp(charId, xpReward, 'talk');
+        // Diminishing XP returns based on recent exchanges
+        // First 5: full XP (5), next 5: reduced (2), after 10: none (0)
+        let xpReward;
+        if (isFirstMeeting) {
+          xpReward = XP_REWARDS.first_meeting;
+        } else if (newExchangeCount <= 5) {
+          xpReward = XP_REWARDS.talk;
+        } else if (newExchangeCount <= 10) {
+          xpReward = 2;
+        } else {
+          xpReward = 0;
+        }
+        
+        const xpResult = xpReward > 0 ? await awardXp(charId, xpReward, 'talk') : { xpGained: 0 };
         
         const msg = `${me.name} says to ${listener.name}: "${message.slice(0, 100)}"`;
         await pool.query(
@@ -680,7 +840,24 @@ app.post('/api/action/:charId', async (req, res) => {
           message: message.slice(0, 500)
         });
         
-        result = { success: true, message: msg, listener: listener.name, xp: xpResult };
+        // Build response with fatigue info
+        let fatigueWarning = null;
+        if (newExchangeCount >= 12) {
+          fatigueWarning = `You've been talking to ${listener.name} for a while. Consider exploring elsewhere soon!`;
+        } else if (newExchangeCount >= 8) {
+          fatigueWarning = `Conversation getting long. XP rewards diminishing.`;
+        }
+        
+        result = { 
+          success: true, 
+          message: msg, 
+          listener: listener.name, 
+          xp: xpResult,
+          energy: currentEnergy - energyCost,
+          exchangeCount: newExchangeCount,
+          fatigueWarning,
+          cooldownIn: newCooldown > 0 ? 0 : (15 - newExchangeCount)
+        };
         break;
       }
       
@@ -720,6 +897,39 @@ app.post('/api/action/:charId', async (req, res) => {
         }
         
         const o = obj.rows[0];
+        
+        // Special handling for rest spots (campfire, cottage)
+        const isRestSpot = o.name.toLowerCase().includes('campfire') || 
+                          o.name.toLowerCase().includes('cottage') ||
+                          o.name.toLowerCase().includes('pond');
+        
+        if (isRestSpot) {
+          // Restore energy
+          const energyRestored = o.name.toLowerCase().includes('cottage') ? 50 : 30;
+          await pool.query(
+            'UPDATE characters SET energy = LEAST(max_energy, energy + $1) WHERE id = $2',
+            [energyRestored, charId]
+          );
+          
+          const newEnergy = await pool.query('SELECT energy, max_energy FROM characters WHERE id = $1', [charId]);
+          
+          await pool.query(
+            'INSERT INTO activity_log (tick, character_id, action, message) VALUES ($1, $2, $3, $4)',
+            [tick, charId, 'rest', `${me.name} rests at the ${o.name} and recovers energy`]
+          );
+          
+          broadcast('rest', { id: charId, name: me.name, object: o.name, energyRestored });
+          
+          result = { 
+            success: true, 
+            object: o.name, 
+            result: `You rest at the ${o.name} and feel refreshed. (+${energyRestored} energy)`,
+            energy: newEnergy.rows[0].energy,
+            maxEnergy: newEnergy.rows[0].max_energy,
+            xp: await awardXp(charId, 2, 'rest')
+          };
+          break;
+        }
         
         // XP for exploring
         const xpResult = await awardXp(charId, XP_REWARDS.interact, 'interact');

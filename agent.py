@@ -62,6 +62,10 @@ class LLMRPGAgent:
         self.emoji = None
         self.personality = None
         self.traits = []
+        
+        # Action history for memory
+        self.action_history = []  # List of {"action": ..., "result": ..., "position": ...}
+        self.max_history = 30
     
     def get_character_info(self) -> bool:
         """Fetch character info from server using token."""
@@ -104,16 +108,62 @@ class LLMRPGAgent:
         return r.json()
     
     def build_prompt(self, state: dict) -> tuple:
-        """Build a prompt for Ollama based on world state."""
+        """Build a prompt for Ollama based on world state and action history."""
         
         text_desc = state.get("textDescription", "")
         nearby_chars = state.get("nearbyCharacters", [])
         recent_convos = state.get("recentConversations", [])
         can_talk = state.get("canTalk", False)
         valid_moves = state.get("validMoves", [])
+        blocked_moves = state.get("blockedMoves", [])
+        needs_rest = state.get("needsRest", False)
+        rest_spots = state.get("restSpotsNearby", [])
+        is_night = state.get("world", {}).get("isNight", False)
+        
+        # Get energy info
+        char_data = state.get("character", {})
+        energy = char_data.get("energy", 100)
         
         # Format traits
         traits_str = ", ".join(self.traits) if self.traits else ""
+        
+        # Build action history context
+        history_context = ""
+        if self.action_history:
+            history_context = "\n📜 YOUR RECENT ACTION HISTORY:\n"
+            for entry in self.action_history[-10:]:  # Show last 10 in prompt
+                status = "✓" if entry["result"] == "SUCCESS" else "✗"
+                history_context += f"  {status} Turn {entry['turn']} at {entry['position']}: {entry['action']} → {entry['result']}\n"
+            
+            # Analyze patterns
+            recent_fails = [e for e in self.action_history[-10:] if "FAILED" in e["result"]]
+            if len(recent_fails) >= 3:
+                failed_directions = [e["action"].replace("move ", "") for e in recent_fails if e["action"].startswith("move")]
+                if failed_directions:
+                    history_context += f"\n⚠️ WARNING: You keep failing when moving {', '.join(set(failed_directions))}! Try a DIFFERENT direction!\n"
+            
+            # Check if stuck in same area
+            recent_positions = [e["position"] for e in self.action_history[-10:]]
+            unique_positions = set(recent_positions)
+            if len(unique_positions) <= 2 and len(recent_positions) >= 5:
+                history_context += f"\n🚨 STUCK ALERT: You've been in the same 1-2 spots for {len(recent_positions)} turns! Move somewhere completely NEW!\n"
+        
+        # Check conversation fatigue with nearby characters
+        conversation_warning = ""
+        if nearby_chars:
+            for char in nearby_chars:
+                fatigue = char.get("conversationFatigue", {})
+                exchanges = fatigue.get("exchanges", 0)
+                cooldown = fatigue.get("cooldownUntil", 0)
+                current_tick = state.get("world", {}).get("tick", 0)
+                
+                if cooldown > current_tick:
+                    conversation_warning = f"\n⛔ CONVERSATION BREAK: You've talked to {char['name']} too much! You MUST explore elsewhere for {cooldown - current_tick} ticks before chatting again.\n"
+                    can_talk = False  # Force no talking
+                elif exchanges >= 10:
+                    conversation_warning = f"\n😴 CONVERSATION STALE: You've said everything to {char['name']} for now. No more XP from talking. Consider exploring!\n"
+                elif exchanges >= 5:
+                    conversation_warning = f"\n💤 CONVERSATION WINDING DOWN: You've talked with {char['name']} a lot ({exchanges} exchanges). XP rewards diminishing.\n"
         
         # Build conversation context
         convo_context = ""
@@ -123,6 +173,49 @@ class LLMRPGAgent:
                 speaker = c.get("speaker_name", "Someone")
                 msg = c.get("message", "")
                 convo_context += f'  {speaker}: "{msg}"\n'
+        
+        # PRIORITY 1: Need rest and near rest spot
+        if needs_rest and rest_spots:
+            closest_rest = rest_spots[0]["name"]
+            prompt = f"""You are {self.name}. 
+Personality: {self.personality}
+
+⚠️ CRITICAL: Your energy is very low ({energy})! You MUST rest!
+There is a {closest_rest} nearby where you can rest.
+
+Use: interact {closest_rest.lower().split()[0]}
+
+Reply with ONLY: interact campfire OR interact cottage OR interact pond"""
+            return prompt, "rest"
+        
+        # PRIORITY 2: Need rest but no spot nearby - find one
+        if needs_rest:
+            prompt = f"""You are {self.name}, exploring the world.
+{history_context}
+{text_desc}
+
+⚠️ CRITICAL: Your energy is very low ({energy})! You need to find a campfire, cottage, or pond to rest!
+Move toward a rest spot. Look for 🔥 campfire, 🏠 cottage, or 💧 pond.
+
+✅ Valid moves: {', '.join(valid_moves)}
+❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
+
+Reply with ONLY one of: move north | move south | move east | move west"""
+            return prompt, "move"
+        
+        # PRIORITY 3: In conversation cooldown - must explore
+        if conversation_warning and "BREAK" in conversation_warning:
+            prompt = f"""You are {self.name}, exploring the world.
+{history_context}
+{conversation_warning}
+{text_desc}
+
+You CANNOT talk right now. You must EXPLORE elsewhere!
+✅ Valid moves: {', '.join(valid_moves)}
+❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
+
+Reply with ONLY one of: move north | move south | move east | move west"""
+            return prompt, "move"
         
         if can_talk and nearby_chars:
             other = nearby_chars[0]
@@ -135,21 +228,29 @@ class LLMRPGAgent:
                     last_said_to_me = c.get("message")
                     break
             
+            # Add fatigue context
+            fatigue_note = conversation_warning if conversation_warning else ""
+            
             if last_said_to_me:
                 prompt = f"""You are {self.name}. 
 Personality: {self.personality}
 Traits: {traits_str}
+Energy: {energy}
+{fatigue_note}
 
 {other_name} just said to you: "{last_said_to_me}"
 {convo_context}
 
 Respond naturally in character. Keep it to 1-2 sentences.
+{f"(Note: conversation is getting long, maybe wrap up soon!)" if fatigue_note else ""}
 
 Say your response (dialogue only, no actions):"""
             else:
                 prompt = f"""You are {self.name}.
 Personality: {self.personality}
 Traits: {traits_str}
+Energy: {energy}
+{fatigue_note}
 
 You see {other_name} right next to you! Start a conversation.
 {convo_context}
@@ -165,24 +266,36 @@ Say your greeting (dialogue only):"""
             directions = other.get("direction", valid_moves)
             
             prompt = f"""You are {self.name}, exploring the world. You see {other['name']} in the distance!
-
+{history_context}
 {text_desc}
 
-Move toward them to meet them. Pick the best direction.
-Valid moves: {', '.join(valid_moves)}
-To approach {other['name']}, try: {', '.join(directions)}
+GOAL: Move toward {other['name']} to meet them!
+✅ Valid moves: {', '.join(valid_moves)}
+❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
+➡️ To approach {other['name']}, try: {', '.join(directions)}
+
+IMPORTANT: Check your action history above! Don't repeat failed moves!
 
 Reply with ONLY one of: move north | move south | move east | move west"""
             
             return prompt, "move"
         
         else:
+            time_note = "🌙 It's night time. The world is quiet." if is_night else ""
+            
             prompt = f"""You are {self.name}, exploring the world.
-
+{history_context}
+{time_note}
 {text_desc}
 
-Pick a direction to explore. Be adventurous! Try somewhere new.
-Valid moves: {', '.join(valid_moves)}
+GOAL: Explore new areas! Find other characters to meet!
+✅ Valid moves: {', '.join(valid_moves)}
+❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
+
+IMPORTANT: Check your action history above! 
+- Don't repeat failed moves!
+- If you're stuck, try the OPPOSITE direction!
+- Explore areas you haven't been to!
 
 Reply with ONLY one of: move north | move south | move east | move west"""
             
@@ -199,6 +312,14 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
             return "talk", {"message": message[:300] or "Hello!"}
+        
+        elif expected_type == "rest":
+            # Parse interact command for resting
+            response_lower = response.lower()
+            for target in ["campfire", "cottage", "pond"]:
+                if target in response_lower:
+                    return "interact", {"target": target}
+            return "interact", {"target": "campfire"}  # Fallback
         
         else:
             response_lower = response.lower()
@@ -229,6 +350,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
         print("Press Ctrl+C to stop\n")
         
         turn = 0
+        
         while True:
             try:
                 state = self.look()
@@ -247,13 +369,18 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 
                 turn += 1
                 char = state.get("character", {})
+                current_pos = (char.get('x'), char.get('y'))
+                energy = char.get('energy', 100)
+                is_night = state.get('world', {}).get('isNight', False)
                 
                 print(f"\n{'═' * 50}")
-                print(f"Turn {turn} │ Tick {state.get('world', {}).get('tick', '?')} │ "
+                time_icon = '🌙' if is_night else '☀️'
+                print(f"Turn {turn} │ Tick {state.get('world', {}).get('tick', '?')} {time_icon} │ "
                       f"L{char.get('level')} │ "
                       f"HP {char.get('hp')}/{char.get('max_hp')} │ "
-                      f"XP {char.get('xp')}")
-                print(f"Position: ({char.get('x')}, {char.get('y')})")
+                      f"XP {char.get('xp')} │ "
+                      f"⚡{energy}")
+                print(f"Position: {current_pos}")
                 
                 # Show who's nearby
                 nearby = state.get('nearbyCharacters', [])
@@ -263,7 +390,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 
                 print(f"{'─' * 50}")
                 
-                # Build prompt and call Ollama
+                # Build prompt with action history
                 prompt, expected_type = self.build_prompt(state)
                 
                 print(f"🤔 Thinking...")
@@ -274,16 +401,48 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 
                 if action == "talk":
                     print(f'💬 "{params["message"]}"')
+                    action_desc = f"talk: {params['message'][:50]}"
+                elif action == "interact":
+                    print(f"💤 Resting at {params.get('target', 'rest spot')}")
+                    action_desc = f"rest at {params.get('target', '?')}"
                 else:
                     print(f"🚶 Moving {params.get('direction', '?')}")
+                    action_desc = f"move {params.get('direction', '?')}"
                 
                 result = self.act(action, **params)
                 
+                # Record in history
                 if "error" in result:
                     print(f"❌ {result['error']}")
+                    if result.get('needRest'):
+                        print(f"   💤 Find a campfire or cottage to rest!")
+                    if result.get('conversationFatigue'):
+                        print(f"   😴 Take a break from this conversation!")
+                    history_entry = {
+                        "turn": turn,
+                        "action": action_desc,
+                        "result": f"FAILED: {result['error']}",
+                        "position": current_pos
+                    }
                 else:
+                    # Show any fatigue warnings
+                    if result.get('fatigueWarning'):
+                        print(f"   ⚠️ {result['fatigueWarning']}")
+                    if result.get('energy') is not None:
+                        print(f"   ⚡ Energy: {result['energy']}")
+                    
+                    history_entry = {
+                        "turn": turn,
+                        "action": action_desc,
+                        "result": "SUCCESS",
+                        "position": current_pos
+                    }
                     if result.get("xp", {}).get("leveledUp"):
                         print(f"🎉 LEVEL UP! Now level {result['xp']['newLevel']}!")
+                
+                self.action_history.append(history_entry)
+                if len(self.action_history) > self.max_history:
+                    self.action_history = self.action_history[-self.max_history:]
                 
                 time.sleep(POLL_INTERVAL)
                 

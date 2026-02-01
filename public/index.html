@@ -144,6 +144,15 @@
     }
     .convo-header { font-size: 0.8rem; color: #888; margin-bottom: 5px; }
     .convo-message { font-style: italic; }
+    .convo-message .emote { 
+      font-style: italic; 
+      color: #8b7ec9; 
+      font-size: 0.85em;
+      display: block;
+      margin: 4px 0;
+      padding-left: 10px;
+      border-left: 2px solid #8b7ec944;
+    }
     
     .activity-list { max-height: 200px; overflow-y: auto; font-size: 0.85rem; }
     .activity {
@@ -188,7 +197,9 @@
         <span class="status-dot" id="statusDot"></span>
         <span id="connectionStatus">Connecting...</span>
       </span>
-      &nbsp;|&nbsp; Tick: <span id="tickCount">0</span>
+      &nbsp;|&nbsp; 
+      <span id="dayNight">☀️</span>
+      Tick: <span id="tickCount">0</span>
     </div>
   </header>
   
@@ -297,17 +308,30 @@
       
       list.innerHTML = sorted.length === 0 
         ? '<li style="color:#666;justify-content:center;">No characters yet</li>'
-        : sorted.slice(0, 10).map((char, i) => `
+        : sorted.slice(0, 10).map((char, i) => {
+          const energy = char.energy || 100;
+          const maxEnergy = char.max_energy || 100;
+          const energyPercent = (energy / maxEnergy) * 100;
+          const energyColor = energyPercent > 50 ? '#2ecc71' : energyPercent > 20 ? '#f39c12' : '#e74c3c';
+          return `
           <li>
             <span class="rank">${i + 1}</span>
             <span class="char-emoji">${char.emoji}</span>
             <div class="char-info">
               <div class="char-name">${char.name}</div>
-              <div class="char-stats">HP: ${char.hp}/${char.max_hp} · XP: ${char.xp}</div>
+              <div class="char-stats">
+                HP: ${char.hp}/${char.max_hp} · XP: ${char.xp}
+                <span style="color:${energyColor}">⚡${energy}</span>
+              </div>
             </div>
             <span class="level-badge">L${char.level}</span>
           </li>
-        `).join('');
+        `}).join('');
+    }
+    
+    function parseEmotes(text) {
+      // Parse *emotes* and style them differently
+      return text.replace(/\*([^*]+)\*/g, '<span class="emote">$1</span>');
     }
     
     function renderConversations() {
@@ -322,7 +346,7 @@
             ${c.speaker_emoji || '💬'} ${c.speaker_name} → ${c.listener_name}
             <span style="float:right;color:#555;">tick ${c.tick}</span>
           </div>
-          <div class="convo-message">"${c.message}"</div>
+          <div class="convo-message">${parseEmotes(c.message)}</div>
         </div>
       `).join('');
     }
@@ -358,6 +382,13 @@
       eventSource.addEventListener('tick', (e) => {
         const data = JSON.parse(e.data);
         document.getElementById('tickCount').textContent = data.tick;
+        document.getElementById('dayNight').textContent = data.isNight ? '🌙' : '☀️';
+      });
+      
+      eventSource.addEventListener('day_night', (e) => {
+        const data = JSON.parse(e.data);
+        document.getElementById('dayNight').textContent = data.isNight ? '🌙' : '☀️';
+        // Could add visual effect here
       });
       
       eventSource.addEventListener('move', (e) => {

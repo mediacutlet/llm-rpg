@@ -444,13 +444,17 @@ app.get('/api/me', async (req, res) => {
 app.get('/api/world', async (req, res) => {
   try {
     const world = await pool.query('SELECT * FROM world WHERE id = 1');
+    const currentTick = world.rows[0]?.tick || 0;
+    
+    // Only show characters who acted in the last 15 ticks (online)
     const characters = await pool.query(`
       SELECT id, name, emoji, x, y, hp, max_hp, xp, level, is_active, 
              turn_interval, last_action_tick, created_at,
              COALESCE(energy, 100) as energy, COALESCE(max_energy, 100) as max_energy
-      FROM characters WHERE is_active = true
-      ORDER BY created_at
-    `);
+      FROM characters 
+      WHERE is_active = true AND last_action_tick > $1 - 15
+      ORDER BY xp DESC
+    `, [currentTick]);
     const objects = await pool.query('SELECT * FROM objects');
     const recentConvos = await pool.query(`
       SELECT c.*, 
@@ -475,6 +479,32 @@ app.get('/api/world', async (req, res) => {
       conversations: recentConvos.rows,
       activity: recentActivity.rows
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Logout - mark character as offline
+app.post('/api/logout', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'No token' });
+    }
+    
+    const char = await pool.query('SELECT id, name FROM characters WHERE token = $1', [token]);
+    if (char.rows.length === 0) {
+      return res.status(404).json({ error: 'Character not found' });
+    }
+    
+    const charId = char.rows[0].id;
+    const charName = char.rows[0].name;
+    
+    // Set last_action_tick to 0 to mark as offline
+    await pool.query('UPDATE characters SET last_action_tick = 0 WHERE id = $1', [charId]);
+    
+    console.log(`👋 ${charName} logged out`);
+    res.json({ success: true, message: `${charName} logged out` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -754,7 +784,7 @@ app.get('/api/look/:charId', async (req, res) => {
     // Get recent world events (last 5 ticks)
     const worldTick = world.rows[0]?.tick || 0;
     const recentEvents = await pool.query(`
-      SELECT tick, message FROM activity 
+      SELECT tick, message FROM activity_log 
       WHERE action = 'world_event' AND tick > $1 - 5
       ORDER BY tick DESC LIMIT 3
     `, [worldTick]);

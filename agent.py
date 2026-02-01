@@ -1337,7 +1337,16 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 time.sleep(POLL_INTERVAL)
                 
             except KeyboardInterrupt:
-                print(f"\n\n👋 Stopped. {self.name} will idle until you return.")
+                print(f"\n\n👋 Logging out {self.name}...")
+                try:
+                    # Call logout endpoint to remove from world
+                    r = requests.post(f"{self.server}/api/logout", headers=self.headers, timeout=5)
+                    if r.status_code == 200:
+                        print(f"✅ {self.name} has left the world.")
+                    else:
+                        print(f"⚠️ Logout failed: {r.text}")
+                except:
+                    print(f"⚠️ Could not reach server for logout.")
                 break
             except requests.exceptions.RequestException as e:
                 print(f"\n⚠️ Connection error: {e}")

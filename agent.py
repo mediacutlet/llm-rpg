@@ -304,20 +304,6 @@ Move toward a rest spot. Look for 🔥 campfire, 🏠 cottage, or 💧 pond.
 Reply with ONLY one of: move north | move south | move east | move west"""
             return prompt, "move", None
         
-        # PRIORITY 3: In conversation cooldown - must explore
-        if conversation_warning and "BREAK" in conversation_warning:
-            prompt = f"""You are {self.name}, exploring the world.
-{history_context}
-{conversation_warning}
-{text_desc}
-
-You CANNOT talk right now. You must EXPLORE elsewhere!
-✅ Valid moves: {', '.join(valid_moves)}
-❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
-
-Reply with ONLY one of: move north | move south | move east | move west"""
-            return prompt, "move", None
-        
         # PRIORITY 4: Must leave after saying goodbye
         if self.must_leave:
             # Set cooldown so we don't re-engage immediately

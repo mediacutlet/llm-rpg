@@ -47,9 +47,9 @@ async function migrate() {
     await pool.query('UPDATE characters SET energy = COALESCE(energy, 100), max_energy = COALESCE(max_energy, 100)');
     console.log('✅ Fixed all character energy values (NULL → 100)');
     
-    // Reset conversation exchanges
-    await pool.query('UPDATE relationships SET recent_exchanges = COALESCE(recent_exchanges, 0), cooldown_until_tick = COALESCE(cooldown_until_tick, 0)');
-    console.log('✅ Reset all conversation exchanges');
+    // FORCE reset conversation exchanges and cooldowns
+    await pool.query('UPDATE relationships SET recent_exchanges = 0, cooldown_until_tick = 0');
+    console.log('✅ Reset all conversation cooldowns to 0');
     
     console.log('\n✨ Migration complete!');
   } catch (err) {

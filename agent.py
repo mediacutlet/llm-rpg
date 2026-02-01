@@ -89,6 +89,9 @@ class LLMRPGAgent:
         # Traveling state - keep moving in same direction after goodbye
         self.traveling_direction = None
         self.traveling_turns = 0
+        
+        # Track recently blocked directions to avoid repeating failed moves
+        self.blocked_directions = {}  # {direction: tick_when_blocked}
     
     def get_character_info(self) -> bool:
         """Fetch character info from server using token."""
@@ -284,16 +287,34 @@ TOPICS: [comma-separated list of 3-5 key topics]"""
         can_talk = state.get("canTalk", False)
         valid_moves = state.get("validMoves", [])
         blocked_moves = state.get("blockedMoves", [])
-        needs_rest = state.get("needsRest", False)
         rest_spots = state.get("restSpotsNearby", [])
+        food_spots = state.get("foodSpotsNearby", [])
         is_night = state.get("world", {}).get("isNight", False)
         
-        # Get energy info
+        # Get energy and hunger info
         char_data = state.get("character", {})
         energy = char_data.get("energy", 100)
+        hunger = char_data.get("hunger", 100)
+        current_tick = int(state.get("world", {}).get("tick", 0) or 0)
         
-        # Agent-side energy check (more conservative than server's < 30)
-        needs_rest = energy < 50 or state.get("needsRest", False)
+        # Clear old blocked directions (blocked more than 5 ticks ago = we've probably moved)
+        for direction in list(self.blocked_directions.keys()):
+            if current_tick - self.blocked_directions[direction] > 5:
+                del self.blocked_directions[direction]
+        
+        # Filter valid_moves to prefer non-recently-blocked directions
+        unblocked_moves = [d for d in valid_moves if d not in self.blocked_directions]
+        if not unblocked_moves:
+            # All directions are blocked, reset and try again
+            self.blocked_directions = {}
+            unblocked_moves = valid_moves
+        
+        # Use unblocked_moves as our preferred valid moves
+        preferred_moves = unblocked_moves if unblocked_moves else valid_moves
+        
+        # Check needs (from server or local thresholds)
+        needs_rest = energy < 40 or state.get("needsRest", False)
+        needs_food = hunger < 40 or state.get("needsFood", False)
         
         # Format traits
         traits_str = ", ".join(self.traits) if self.traits else ""
@@ -350,7 +371,8 @@ TOPICS: [comma-separated list of 3-5 key topics]"""
         # Get current tick for timing checks
         current_tick = int(state.get("world", {}).get("tick", 0) or 0)
         
-        # PRIORITY 0: If we're next to someone and need to leave, say goodbye first!
+        # PRIORITY 0: If we're next to someone and REALLY need to leave, say goodbye first
+        # (Only for urgent needs - otherwise let conversations flow naturally)
         if can_talk and nearby_chars and not self.must_leave:
             other = nearby_chars[0]
             other_name = other["name"]
@@ -358,22 +380,62 @@ TOPICS: [comma-separated list of 3-5 key topics]"""
             
             # Skip if already in cooldown (already said goodbye)
             if other_id not in self.goodbye_cooldown:
-                # Check how many exchanges we've had (local tracking is more reliable)
+                # Check how many exchanges we've had
                 our_messages = self.conversation_memory.get(other_id, [])
                 exchange_count = len(our_messages)
                 
-                # Reasons to leave: low energy, or talked too much
-                should_leave = needs_rest or exchange_count >= 8
+                # Reasons to leave (more relaxed):
+                # - Critically low energy (<25) or hunger (<20) - urgent, leave after 2 exchanges
+                # - Had 10+ exchanges - natural conversation endpoint
+                urgent_need = (energy < 25 or hunger < 20) and exchange_count >= 2
+                talked_enough = exchange_count >= 10
                 
-                if should_leave and exchange_count >= 1:  # Only if we've actually talked
-                    reason = "need to find somewhere to rest" if needs_rest else "been chatting for a while"
+                should_leave = urgent_need or talked_enough
+                
+                if should_leave:
+                    if energy < 25:
+                        reason = "need to rest soon"
+                    elif hunger < 20:
+                        reason = "need to get some food"
+                    else:
+                        reason = "should explore more of the world"
+                    
                     prompt = f"""You are {self.name}.
-You've {reason} and need to say goodbye to {other_name} before leaving.
+You've {reason} and want to say goodbye to {other_name}.
 
 Say goodbye warmly in one sentence. Use "goodbye", "farewell", "I should go", or "take care":"""
                     return prompt, "goodbye", other_id
         
-        # PRIORITY 1: Need rest and near rest spot (within interaction range) - only if alone
+        # PRIORITY 1: Need food and near market (within interaction range) - only if alone
+        if needs_food and food_spots and not (can_talk and nearby_chars):
+            closest_food = food_spots[0]
+            closest_name = closest_food["name"]
+            closest_dist = closest_food.get("distance", 10)
+            
+            if closest_dist <= 2.5:
+                # Close enough to interact
+                prompt = f"""You are {self.name}. 
+
+🍖 You're hungry ({hunger})! There's a {closest_name} right here.
+Eat something to restore your hunger and get some energy!
+
+Reply with ONLY: interact market"""
+                return prompt, "eat", None
+            else:
+                # Need to move closer to market
+                directions = closest_food.get("direction", valid_moves)
+                safe_dirs = [d for d in directions if d in preferred_moves]
+                dir_hint = safe_dirs[0] if safe_dirs else (directions[0] if directions else "south")
+                prompt = f"""You are {self.name}, exploring the world.
+{text_desc}
+
+🍖 You're getting hungry ({hunger})! There's a {closest_name} nearby ({closest_dist:.0f} tiles away).
+Move {dir_hint.upper()} toward it to eat!
+
+Reply with ONLY: move {dir_hint}"""
+                return prompt, "move", None
+        
+        # PRIORITY 2: Need rest and near rest spot (within interaction range) - only if alone
         if needs_rest and rest_spots and not (can_talk and nearby_chars):
             closest_rest = rest_spots[0]
             closest_name = closest_rest["name"]
@@ -404,22 +466,35 @@ Move {dir_hint.upper()} toward it to rest!
 Reply with ONLY: move {dir_hint}"""
                 return prompt, "move", None
         
-        # PRIORITY 2: Need rest but no spot nearby (and not talking to someone) - find one
+        # PRIORITY 3: Need rest but no spot nearby (and not talking to someone) - find one
         if needs_rest and not (can_talk and nearby_chars):
             prompt = f"""You are {self.name}, exploring the world.
 {history_context}
 {text_desc}
 
-⚠️ CRITICAL: Your energy is very low ({energy})! You need to find a campfire, cottage, or pond to rest!
+⚠️ Your energy is low ({energy})! You need to find a campfire, cottage, or pond to rest!
 Move toward a rest spot. Look for 🔥 campfire, 🏠 cottage, or 💧 pond.
 
 ✅ Valid moves: {', '.join(valid_moves)}
-❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
 
 Reply with ONLY one of: move north | move south | move east | move west"""
             return prompt, "move", None
         
-        # PRIORITY 4: Must leave after saying goodbye
+        # PRIORITY 4: Need food but no market nearby (and not talking) - find the market
+        if needs_food and not food_spots and not (can_talk and nearby_chars):
+            prompt = f"""You are {self.name}, exploring the world.
+{history_context}
+{text_desc}
+
+🍖 You're getting hungry ({hunger})! You need to find the Market to eat!
+Look for 🏪 Market - it's usually near the center of the meadow.
+
+✅ Valid moves: {', '.join(valid_moves)}
+
+Reply with ONLY one of: move north | move south | move east | move west"""
+            return prompt, "move", None
+        
+        # PRIORITY 5: Must leave after saying goodbye
         if self.must_leave:
             # Set cooldown so we don't re-engage immediately
             if self.leaving_from:
@@ -670,18 +745,25 @@ What you say:"""
             other_id = other.get("id", other["name"])
             directions = other.get("direction", valid_moves)
             
+            # Filter directions to prefer non-blocked ones
+            safe_directions = [d for d in directions if d in preferred_moves]
+            if not safe_directions:
+                safe_directions = [d for d in directions if d in valid_moves]
+            if not safe_directions:
+                safe_directions = preferred_moves if preferred_moves else valid_moves
+            
             # If we're in goodbye cooldown with this person, DON'T approach - explore elsewhere
             if other_id in self.goodbye_cooldown:
                 # Pick opposite direction from them
                 avoid_directions = []
                 for d in directions:
                     opposites = {'north': 'south', 'south': 'north', 'east': 'west', 'west': 'east'}
-                    if opposites.get(d) in valid_moves:
+                    if opposites.get(d) in preferred_moves:
                         avoid_directions.append(opposites[d])
                 if not avoid_directions:
-                    avoid_directions = [d for d in valid_moves if d not in directions]
+                    avoid_directions = [d for d in preferred_moves if d not in directions]
                 if not avoid_directions:
-                    avoid_directions = valid_moves
+                    avoid_directions = preferred_moves if preferred_moves else valid_moves
                 
                 prompt = f"""You are {self.name}, exploring the world.
 {history_context}
@@ -694,21 +776,26 @@ Go AWAY from them - try: {', '.join(avoid_directions)}
 Reply with ONLY: move {avoid_directions[0] if avoid_directions else 'south'}"""
                 return prompt, "move", None
             
+            best_direction = safe_directions[0] if safe_directions else 'south'
             prompt = f"""You are {self.name}, exploring the world. You see {other['name']} in the distance!
 {text_desc}
 
 🎯 GOAL: Go meet {other['name']}!
 📍 They are to the {' and '.join(directions)} of you.
 ✅ Valid moves: {', '.join(valid_moves)}
+🚫 Recently blocked: {', '.join(self.blocked_directions.keys()) if self.blocked_directions else 'none'}
 
-To reach them, move {directions[0].upper()} now!
+To reach them, move {best_direction.upper()} now!
 
-Reply with ONLY: move {directions[0]}"""
+Reply with ONLY: move {best_direction}"""
             
             return prompt, "move", None
         
         else:
             time_note = "🌙 It's night time. The world is quiet." if is_night else ""
+            
+            # Suggest a preferred direction
+            suggested = preferred_moves[0] if preferred_moves else (valid_moves[0] if valid_moves else 'south')
             
             prompt = f"""You are {self.name}, exploring the world.
 {history_context}
@@ -717,12 +804,8 @@ Reply with ONLY: move {directions[0]}"""
 
 GOAL: Explore new areas! Find other characters to meet!
 ✅ Valid moves: {', '.join(valid_moves)}
-❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
-
-IMPORTANT: Check your action history above! 
-- Don't repeat failed moves!
-- If you're stuck, try the OPPOSITE direction!
-- Explore areas you haven't been to!
+🚫 Recently blocked: {', '.join(self.blocked_directions.keys()) if self.blocked_directions else 'none'}
+💡 Suggested: {suggested}
 
 Reply with ONLY one of: move north | move south | move east | move west"""
             
@@ -745,6 +828,14 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             message = re.sub(r'__([^_]+)__', r'\1', message)  # __bold__ -> bold
             message = re.sub(r'_([^_]+)_', r'\1', message)  # _italic_ -> italic
             message = re.sub(r'\*+', '', message)  # Remove any remaining stray asterisks
+            
+            # Strip parenthetical stage directions like (pauses) or (leans forward)
+            message = re.sub(r'\([^)]*\)', '', message)
+            
+            # Strip action words at start of sentences (verbs followed by descriptions)
+            action_starters = r'^(zooms|leans|adjusts|smiles|grins|nods|waves|sighs|laughs|giggles|chuckles|pauses|looks|glances|turns|steps|moves|walks|runs|jumps|reaches|points|gestures|shrugs|tilts|raises|lowers|crosses|uncrosses|shifts|settles|straightens|relaxes)\b[^.!?]*[.!?]?\s*'
+            message = re.sub(action_starters, '', message, flags=re.IGNORECASE)
+            
             message = re.sub(r'\s+', ' ', message).strip()  # Clean up extra spaces
             
             # Truncate if way too long (model went on a monologue)
@@ -781,6 +872,10 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if target in response_lower:
                     return "interact", {"target": target}
             return "interact", {"target": "campfire"}  # Fallback
+        
+        elif expected_type == "eat":
+            # Parse interact command for eating at market
+            return "interact", {"target": "market"}
         
         else:
             response_lower = response.lower()
@@ -832,6 +927,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 char = state.get("character", {})
                 current_pos = (char.get('x'), char.get('y'))
                 energy = char.get('energy', 100)
+                hunger = char.get('hunger', 100)
                 is_night = state.get('world', {}).get('isNight', False)
                 
                 print(f"\n{'═' * 50}")
@@ -840,7 +936,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                       f"L{char.get('level')} │ "
                       f"HP {char.get('hp')}/{char.get('max_hp')} │ "
                       f"XP {char.get('xp')} │ "
-                      f"⚡{energy}")
+                      f"⚡{energy} │ 🍖{hunger}")
                 print(f"Position: {current_pos}")
                 
                 # Show who's nearby
@@ -914,8 +1010,13 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         self.last_talked_tick[talk_target_id] = current_tick
                     action_desc = f"talk: {message[:50]}"
                 elif action == "interact":
-                    print(f"💤 Resting at {params.get('target', 'rest spot')}")
-                    action_desc = f"rest at {params.get('target', '?')}"
+                    target = params.get('target', 'something')
+                    if 'market' in target.lower():
+                        print(f"🍖 Eating at {target}")
+                        action_desc = f"eat at {target}"
+                    else:
+                        print(f"💤 Resting at {target}")
+                        action_desc = f"rest at {target}"
                 else:
                     print(f"🚶 Moving {params.get('direction', '?')}")
                     action_desc = f"move {params.get('direction', '?')}"
@@ -932,6 +1033,15 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         # Server rejected talk - we should move away
                         self.must_leave = True
                         self.leaving_from = talk_target_id
+                    
+                    # Track blocked move directions
+                    if action == "move" and "blocks" in result.get('error', '').lower():
+                        direction = params.get('direction')
+                        if direction:
+                            current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+                            self.blocked_directions[direction] = current_tick
+                            print(f"   🚫 Remembering: {direction} is blocked")
+                    
                     history_entry = {
                         "turn": turn,
                         "action": action_desc,
@@ -944,6 +1054,8 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         print(f"   ⚠️ {result['fatigueWarning']}")
                     if result.get('energy') is not None:
                         print(f"   ⚡ Energy: {result['energy']}")
+                    if result.get('hunger') is not None:
+                        print(f"   🍖 Hunger: {result['hunger']}")
                     
                     history_entry = {
                         "turn": turn,

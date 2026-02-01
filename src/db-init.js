@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS characters (
   max_hp INTEGER DEFAULT 100,
   xp INTEGER DEFAULT 0,
   level INTEGER DEFAULT 1,
+  energy INTEGER DEFAULT 100,
+  max_energy INTEGER DEFAULT 100,
+  hunger INTEGER DEFAULT 100,
+  max_hunger INTEGER DEFAULT 100,
   
   -- Activity
   turn_interval INTEGER DEFAULT 1,

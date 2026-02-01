@@ -101,6 +101,7 @@ const XP_REWARDS = {
   talk: 5,
   examine: 2,
   interact: 10,
+  eat: 3,
   first_meeting: 20
 };
 
@@ -205,6 +206,15 @@ async function worldTick() {
         SET energy = LEAST(COALESCE(max_energy, 100), COALESCE(energy, 100) + 5)
         WHERE last_action_tick < $1 - 20
       `, [tick]); // Regen for idle characters
+    }
+    
+    // Every 15 ticks, hunger drains slightly for all active characters
+    if (tick % 15 === 0) {
+      await pool.query(`
+        UPDATE characters 
+        SET hunger = GREATEST(0, COALESCE(hunger, 100) - 2)
+        WHERE is_active = true
+      `);
     }
     
     // Every 50 ticks, decay conversation cooldowns
@@ -616,10 +626,13 @@ app.get('/api/look/:charId', async (req, res) => {
     // Build output similar to local version
     const energy = me.energy || 100;
     const maxEnergy = me.max_energy || 100;
+    const hunger = me.hunger !== undefined ? me.hunger : 100;
+    const maxHunger = me.max_hunger || 100;
     
     let output = `[${me.name} at position ${me.x},${me.y}]\n`;
     output += `HP: ${me.hp}/${me.max_hp} | XP: ${me.xp} | Level: ${me.level}\n`;
-    output += `⚡ Energy: ${energy}/${maxEnergy}${energy < 30 ? ' ⚠️ LOW - find a campfire or cottage to rest!' : ''}\n`;
+    output += `⚡ Energy: ${energy}/${maxEnergy}${energy < 30 ? ' ⚠️ LOW' : ''} | `;
+    output += `🍖 Hunger: ${hunger}/${maxHunger}${hunger < 40 ? ' ⚠️ HUNGRY' : ''}\n`;
     output += `World tick: ${tick} | ${isNight ? '🌙 NIGHT' : '☀️ DAY'}\n\n`;
     
     if (isNight) {
@@ -683,8 +696,11 @@ app.get('/api/look/:charId', async (req, res) => {
         const isRestSpot = obj.name.toLowerCase().includes('campfire') || 
                           obj.name.toLowerCase().includes('cottage') ||
                           obj.name.toLowerCase().includes('pond');
-        const restNote = isRestSpot ? ' 💤 [Can rest here to recover energy]' : '';
-        output += `  ${obj.emoji} ${obj.name} - ${dist}${restNote}\n`;
+        const isMarket = obj.name.toLowerCase().includes('market');
+        let note = '';
+        if (isRestSpot) note = ' 💤 [Rest here]';
+        if (isMarket) note = ' 🍖 [Eat here]';
+        output += `  ${obj.emoji} ${obj.name} - ${dist}${note}\n`;
       }
       output += '\n';
     }
@@ -722,8 +738,17 @@ app.get('/api/look/:charId', async (req, res) => {
       direction: getMoveToward(r.x - me.x, r.y - me.y)
     }));
     
+    // Find food spots nearby (market)
+    const foodSpots = nearbyObjs.filter(o => 
+      o.name.toLowerCase().includes('market')
+    ).map(r => ({
+      name: r.name,
+      distance: r.distance,
+      direction: getMoveToward(r.x - me.x, r.y - me.y)
+    }));
+    
     res.json({
-      character: { ...me, energy, maxEnergy },
+      character: { ...me, energy, maxEnergy, hunger, maxHunger },
       world: { ...world.rows[0], isNight },
       nearbyCharacters: nearbyChars.map(c => ({
         ...c,
@@ -731,11 +756,13 @@ app.get('/api/look/:charId', async (req, res) => {
       })),
       nearbyObjects: nearbyObjs,
       restSpotsNearby: restSpots,
+      foodSpotsNearby: foodSpots,
       memories: memories.rows,
       recentConversations: convos.rows,
       canAct: actAllowed,
       canTalk,
       needsRest: energy < 30,
+      needsFood: hunger < 40,
       validMoves: open,
       blockedMoves: blocked,
       visualMap,
@@ -958,13 +985,12 @@ app.post('/api/action/:charId', async (req, res) => {
           speakerEnergy: currentEnergy - energyCost
         });
         
-        // Build response with fatigue info
+        // Build response with fatigue info (relaxed - only warn at higher thresholds)
         let fatigueWarning = null;
-        if (newExchangeCount >= 12) {
-          fatigueWarning = `You've been talking to ${listener.name} for a while. Consider exploring elsewhere soon!`;
-        } else if (newExchangeCount >= 8) {
-          fatigueWarning = `Conversation getting long. XP rewards diminishing.`;
+        if (newExchangeCount >= 15) {
+          fatigueWarning = `Long conversation with ${listener.name}. Server may enforce a break soon.`;
         }
+        // Removed the intermediate warnings - let conversations flow naturally
         
         result = { 
           success: true, 
@@ -1045,6 +1071,43 @@ app.post('/api/action/:charId', async (req, res) => {
             energy: newEnergy.rows[0].energy,
             maxEnergy: newEnergy.rows[0].max_energy,
             xp: await awardXp(charId, 2, 'rest')
+          };
+          break;
+        }
+        
+        // Special handling for market (eating)
+        const isMarket = o.name.toLowerCase().includes('market');
+        
+        if (isMarket) {
+          // Eating restores hunger fully and gives some energy boost
+          const hungerRestored = 100; // Full hunger restoration
+          const energyBonus = 15; // Small energy bonus from food
+          
+          await pool.query(`
+            UPDATE characters 
+            SET hunger = LEAST(COALESCE(max_hunger, 100), COALESCE(hunger, 0) + $1),
+                energy = LEAST(COALESCE(max_energy, 100), COALESCE(energy, 0) + $2)
+            WHERE id = $3
+          `, [hungerRestored, energyBonus, charId]);
+          
+          const newStats = await pool.query('SELECT energy, max_energy, hunger, max_hunger FROM characters WHERE id = $1', [charId]);
+          
+          await pool.query(
+            'INSERT INTO activity_log (tick, character_id, action, message) VALUES ($1, $2, $3, $4)',
+            [tick, charId, 'eat', `${me.name} eats at the ${o.name}`]
+          );
+          
+          broadcast('eat', { id: charId, name: me.name, object: o.name, hungerRestored, energyBonus });
+          
+          result = { 
+            success: true, 
+            object: o.name, 
+            result: `You eat a hearty meal at the ${o.name}. Hunger satisfied! (+${energyBonus} energy)`,
+            energy: newStats.rows[0].energy,
+            maxEnergy: newStats.rows[0].max_energy,
+            hunger: newStats.rows[0].hunger,
+            maxHunger: newStats.rows[0].max_hunger,
+            xp: await awardXp(charId, 3, 'eat')
           };
           break;
         }

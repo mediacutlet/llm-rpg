@@ -47,7 +47,67 @@
       margin: 0 auto;
     }
     
-    @media (max-width: 1000px) { .container { grid-template-columns: 1fr; } }
+    /* Tablet */
+    @media (max-width: 1000px) { 
+      .container { grid-template-columns: 1fr; } 
+      .sidebar { order: -1; }
+    }
+    
+    /* Mobile */
+    @media (max-width: 600px) {
+      body { padding: 10px; }
+      
+      h1 { font-size: 1.8rem; }
+      .subtitle { font-size: 0.8rem; }
+      .tick-display { font-size: 0.85rem; padding: 4px 10px; }
+      
+      .panel { padding: 10px; }
+      .panel h2 { font-size: 0.9rem; }
+      
+      /* Make world grid scrollable horizontally on small screens */
+      .world-container { 
+        overflow-x: auto; 
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: 10px;
+      }
+      .world-grid {
+        padding: 5px;
+        min-width: max-content;
+      }
+      .cell { 
+        width: 24px; 
+        height: 24px; 
+        font-size: 14px;
+      }
+      .character-marker { font-size: 16px; }
+      
+      /* Compact leaderboard */
+      .leaderboard li { padding: 6px; gap: 6px; }
+      .char-emoji { font-size: 1.2rem; }
+      .char-name { font-size: 0.9rem; }
+      .char-stats { font-size: 0.7rem; }
+      .level-badge { font-size: 0.65rem; padding: 2px 6px; }
+      
+      /* Compact conversations */
+      .conversation-list { max-height: 250px; }
+      .convo { padding: 8px; }
+      .convo-header { font-size: 0.75rem; }
+      .convo-message { font-size: 0.85rem; }
+      
+      /* Compact activity */
+      .activity-list { max-height: 150px; font-size: 0.8rem; }
+      .activity-tick { min-width: 40px; font-size: 0.75rem; }
+      
+      /* Hide join CTA on mobile */
+      .join-cta { display: none; }
+    }
+    
+    /* Very small phones */
+    @media (max-width: 380px) {
+      h1 { font-size: 1.5rem; }
+      .cell { width: 20px; height: 20px; font-size: 12px; }
+      .character-marker { font-size: 14px; }
+    }
     
     .panel {
       background: rgba(255,255,255,0.05);
@@ -63,6 +123,11 @@
       display: flex;
       align-items: center;
       gap: 8px;
+    }
+    
+    .world-container {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
     }
     
     .world-grid {

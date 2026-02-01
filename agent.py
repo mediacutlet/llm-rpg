@@ -92,6 +92,13 @@ class LLMRPGAgent:
         
         # Track recently blocked directions to avoid repeating failed moves
         self.blocked_directions = {}  # {direction: tick_when_blocked}
+        
+        # Resting state - stay at rest spot until fully rested
+        self.is_resting = False
+        self.resting_at = None  # Name of rest spot
+        
+        # Eating state - stay at market until fully fed
+        self.is_eating = False
     
     def get_character_info(self) -> bool:
         """Fetch character info from server using token."""
@@ -346,6 +353,43 @@ TOPICS: [topic1, topic2, topic3]"""
         # Check needs (from server or local thresholds)
         needs_rest = energy < 40 or state.get("needsRest", False)
         needs_food = hunger < 40 or state.get("needsFood", False)
+        max_energy = char_data.get("max_energy", 100)
+        max_hunger = char_data.get("max_hunger", 100)
+        
+        # If we're eating, keep eating until hunger is FULL
+        if self.is_eating:
+            if hunger >= max_hunger:
+                # Fully fed! Stop eating
+                print(f"   🍖 Fully fed! Hunger: {hunger}/{max_hunger}")
+                self.is_eating = False
+            elif food_spots:
+                closest_food = food_spots[0]
+                closest_dist = closest_food.get("distance", 10)
+                if closest_dist <= 2.5:
+                    # Still at market - keep eating
+                    return None, "eat", None  # Direct eat action
+                else:
+                    # Somehow moved away from market
+                    self.is_eating = False
+        
+        # If we're resting, keep resting until energy is FULL
+        if self.is_resting:
+            if energy >= max_energy:
+                # Fully rested! Stop resting
+                print(f"   💪 Fully rested! Energy: {energy}/{max_energy}")
+                self.is_resting = False
+                self.resting_at = None
+            elif rest_spots:
+                # Keep resting
+                closest_rest = rest_spots[0]
+                closest_dist = closest_rest.get("distance", 10)
+                if closest_dist <= 2.5:
+                    # Still at rest spot - keep resting
+                    return None, "rest", None  # Direct rest action
+                else:
+                    # Somehow moved away from rest spot
+                    self.is_resting = False
+                    self.resting_at = None
         
         # Format traits
         traits_str = ", ".join(self.traits) if self.traits else ""
@@ -447,7 +491,8 @@ Say goodbye warmly in one sentence. Use "goodbye", "farewell", "I should go", or
             closest_dist = closest_food.get("distance", 10)
             
             if closest_dist <= 2.5:
-                # Close enough to interact
+                # Close enough to interact - start eating (will continue until full)
+                self.is_eating = True
                 prompt = f"""You are {self.name}. 
 
 🍖 You're hungry ({hunger})! There's a {closest_name} right here.
@@ -476,7 +521,9 @@ Reply with ONLY: move {dir_hint}"""
             closest_dist = closest_rest.get("distance", 10)
             
             if closest_dist <= 2.5:
-                # Close enough to interact
+                # Close enough to interact - start resting (will continue until full)
+                self.is_resting = True
+                self.resting_at = closest_name
                 prompt = f"""You are {self.name}. 
 Personality: {self.personality}
 
@@ -1045,6 +1092,14 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if prompt is None and expected_type.startswith("direct_move_"):
                     action, params = self.parse_response("", expected_type)
                     response = f"[direct: {params.get('direction')}]"
+                elif prompt is None and expected_type == "rest":
+                    # Keep resting - no LLM call needed
+                    action, params = "interact", {"target": self.resting_at.lower().split()[0] if self.resting_at else "campfire"}
+                    response = f"[resting at {self.resting_at}]"
+                elif prompt is None and expected_type == "eat":
+                    # Keep eating - no LLM call needed
+                    action, params = "interact", {"target": "market"}
+                    response = "[eating at market]"
                 else:
                     response = ollama_generate(prompt, self.model)
                     # Parse and execute

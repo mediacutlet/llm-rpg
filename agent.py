@@ -182,7 +182,6 @@ class LLMRPGAgent:
         if not available:
             available = ['something completely unexpected', 'a random observation', 'saying goodbye']
         
-        import random
         random.shuffle(available)
         return ', '.join(available[:3])
     
@@ -277,19 +276,36 @@ class LLMRPGAgent:
                 msg = c.get("message", "")
                 convo_context += f'  {speaker}: "{msg}"\n'
         
-        # PRIORITY 1: Need rest and near rest spot
+        # PRIORITY 1: Need rest and near rest spot (within interaction range)
         if needs_rest and rest_spots:
-            closest_rest = rest_spots[0]["name"]
-            prompt = f"""You are {self.name}. 
+            closest_rest = rest_spots[0]
+            closest_name = closest_rest["name"]
+            closest_dist = closest_rest.get("distance", 10)
+            
+            if closest_dist <= 2.5:
+                # Close enough to interact
+                prompt = f"""You are {self.name}. 
 Personality: {self.personality}
 
 ⚠️ CRITICAL: Your energy is very low ({energy})! You MUST rest!
-There is a {closest_rest} nearby where you can rest.
+There is a {closest_name} right here where you can rest.
 
-Use: interact {closest_rest.lower().split()[0]}
+Use: interact {closest_name.lower().split()[0]}
 
 Reply with ONLY: interact campfire OR interact cottage OR interact pond"""
-            return prompt, "rest", None
+                return prompt, "rest", None
+            else:
+                # Need to move closer to rest spot
+                directions = closest_rest.get("direction", valid_moves)
+                dir_hint = directions[0] if directions else "south"
+                prompt = f"""You are {self.name}, exploring the world.
+{text_desc}
+
+⚠️ Your energy is low ({energy})! There's a {closest_name} nearby ({closest_dist:.0f} tiles away).
+Move {dir_hint.upper()} toward it to rest!
+
+Reply with ONLY: move {dir_hint}"""
+                return prompt, "move", None
         
         # PRIORITY 2: Need rest but no spot nearby - find one
         if needs_rest:
@@ -373,7 +389,6 @@ Reply with ONLY: move {direction}"""
                 
                 # Use traveling direction if set, otherwise pick one
                 if not self.traveling_direction or self.traveling_direction not in valid_moves:
-                    import random
                     if valid_moves:
                         self.traveling_direction = random.choice(valid_moves)
                 
@@ -463,33 +478,26 @@ Say goodbye to them. Be warm but clear that you're leaving. Use a phrase like "g
                 asked_question = '?' in last_said_to_me
                 
                 prompt = f"""You are {self.name}. 
-Personality: {self.personality[:200]}
+Personality: {self.personality[:400]}
 Traits: {traits_str}
 {convo_history}
 
 {other_name} just said: "{last_said_to_me}"
 
-{"They asked you a question - answer it directly first." if asked_question else "Respond naturally to what they said."}
+{"IMPORTANT: They asked you a question! You MUST answer it before saying anything else." if asked_question else ""}
 
-RULES:
-- This is a back-and-forth conversation, not a monologue
-- Keep your response SHORT - just 1-2 sentences, like a real conversation
-- Share ONE thought or ask ONE question, then let them respond
-- No asterisks or action descriptions, just what you say{topic_hint}
+Respond naturally in 2-4 sentences. Share your thoughts, react to what they said, maybe ask a follow-up. Just speak naturally as your character - no *actions* or stage directions.{topic_hint}
 
 Your reply:"""
             else:
                 prompt = f"""You are {self.name}.
-Personality: {self.personality[:200]}
+Personality: {self.personality[:400]}
 Traits: {traits_str}
 {convo_history}
 
-You see {other_name} next to you. {"Continue the conversation." if convo_history else "Start a conversation."}
+You see {other_name} next to you. {"Continue the conversation." if convo_history else "Greet them and start a conversation."}
 
-RULES:
-- Keep it SHORT - just 1-2 sentences to start
-- Say ONE thing or ask ONE question
-- No asterisks or action descriptions, just what you say{topic_hint}
+Speak naturally in 2-4 sentences. Share something about yourself, make an observation, or ask them something. Just speak as your character - no *actions* or stage directions.{topic_hint}
 
 What you say:"""
             

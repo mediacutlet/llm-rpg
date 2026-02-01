@@ -709,7 +709,11 @@ app.get('/api/look/:charId', async (req, res) => {
       o.name.toLowerCase().includes('campfire') || 
       o.name.toLowerCase().includes('cottage') ||
       o.name.toLowerCase().includes('pond')
-    );
+    ).map(r => ({
+      name: r.name,
+      distance: r.distance,
+      direction: getMoveToward(r.x - me.x, r.y - me.y)
+    }));
     
     res.json({
       character: { ...me, energy, maxEnergy },
@@ -719,7 +723,7 @@ app.get('/api/look/:charId', async (req, res) => {
         conversationFatigue: fatigueMap[c.id] || { exchanges: 0, cooldownUntil: 0 }
       })),
       nearbyObjects: nearbyObjs,
-      restSpotsNearby: restSpots.map(r => ({ name: r.name, distance: r.distance })),
+      restSpotsNearby: restSpots,
       memories: memories.rows,
       recentConversations: convos.rows,
       canAct: actAllowed,

@@ -394,7 +394,7 @@ Reply with ONLY: move {self.traveling_direction}"""
                 convo_history = "\n💬 RECENT CONVERSATION:\n"
                 for c in recent_convos[-6:]:  # Last 6 messages for context
                     speaker = c.get("speaker_name", "Someone")
-                    msg = c.get("message", "")[:400]
+                    msg = c.get("message", "")
                     if speaker == self.name:
                         convo_history += f'  YOU: "{msg}"\n'
                     else:
@@ -432,9 +432,9 @@ Reply with ONLY: move {self.traveling_direction}"""
                 if said_goodbye and not we_said_goodbye_recently:
                     # They said goodbye - acknowledge it and leave
                     prompt = f"""You are {self.name}.
-{other_name} is saying goodbye: "{last_said_to_me[:300]}"
+{other_name} is saying goodbye: "{last_said_to_me}"
 
-Say goodbye back warmly. Use "goodbye", "farewell", or "take care". One sentence only:"""
+Say goodbye back warmly. One short sentence - use "goodbye", "farewell", or "take care":"""
                     return prompt, "goodbye", other_id
             
             # Count our local exchanges for goodbye logic
@@ -469,14 +469,15 @@ Traits: {traits_str}
 
 {other_name} just said: "{last_said_to_me}"
 
-{"They asked you a question - ANSWER IT FIRST with a specific response, then you can add your own thought." if asked_question else "React to what they shared, then continue the conversation."}
+{"They asked you a question - answer it directly first." if asked_question else "Respond naturally to what they said."}
 
-IMPORTANT:
-- Actually ANSWER if they asked something (don't just ask another question back)
-- Share something SPECIFIC about yourself or your experiences  
-- Keep it to 3-4 sentences, just dialogue, no *asterisk actions*{topic_hint}
+RULES:
+- This is a back-and-forth conversation, not a monologue
+- Keep your response SHORT - just 1-2 sentences, like a real conversation
+- Share ONE thought or ask ONE question, then let them respond
+- No asterisks or action descriptions, just what you say{topic_hint}
 
-Your response:"""
+Your reply:"""
             else:
                 prompt = f"""You are {self.name}.
 Personality: {self.personality[:200]}
@@ -485,8 +486,10 @@ Traits: {traits_str}
 
 You see {other_name} next to you. {"Continue the conversation." if convo_history else "Start a conversation."}
 
-- Share something interesting about yourself or ask them about their experiences
-- Keep it to 3-4 sentences, just dialogue, no *asterisk actions*{topic_hint}
+RULES:
+- Keep it SHORT - just 1-2 sentences to start
+- Say ONE thing or ask ONE question
+- No asterisks or action descriptions, just what you say{topic_hint}
 
 What you say:"""
             
@@ -565,7 +568,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if message.lower().startswith(prefix.lower()):
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
-            return "talk", {"message": message[:300] or "Hello!"}
+            return "talk", {"message": message or "Hello!"}
         
         elif expected_type == "goodbye":
             # Parse as a talk action but flag for leaving
@@ -576,7 +579,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             message = message.strip().strip('"').strip()
             if not message or len(message) < 3:
                 message = "It was nice talking! I should explore more. Goodbye!"
-            return "talk", {"message": message[:500], "is_goodbye": True}
+            return "talk", {"message": message, "is_goodbye": True}
         
         elif expected_type == "rest":
             # Parse interact command for resting

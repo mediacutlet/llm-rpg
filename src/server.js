@@ -877,17 +877,17 @@ app.post('/api/action/:charId', async (req, res) => {
         
         await pool.query(
           'INSERT INTO conversations (tick, speaker_id, listener_id, message) VALUES ($1, $2, $3, $4)',
-          [tick, charId, listener.id, message.slice(0, 1000)]
+          [tick, charId, listener.id, message]
         );
         
         // Add to both characters' memories
         await pool.query(
           'INSERT INTO memories (character_id, tick, content) VALUES ($1, $2, $3)',
-          [charId, tick, `I said to ${listener.name}: "${message.slice(0, 500)}"`]
+          [charId, tick, `I said to ${listener.name}: "${message}"`]
         );
         await pool.query(
           'INSERT INTO memories (character_id, tick, content) VALUES ($1, $2, $3)',
-          [listener.id, tick, `${me.name} said to me: "${message.slice(0, 500)}"`]
+          [listener.id, tick, `${me.name} said to me: "${message}"`]
         );
         
         // Update relationship with exchange tracking
@@ -934,7 +934,7 @@ app.post('/api/action/:charId', async (req, res) => {
         
         const xpResult = xpReward > 0 ? await awardXp(charId, xpReward, 'talk') : { xpGained: 0 };
         
-        const msg = `${me.name} says to ${listener.name}: "${message.slice(0, 300)}"`;
+        const msg = `${me.name} says to ${listener.name}: "${message}"`;
         await pool.query(
           'INSERT INTO activity_log (tick, character_id, action, message) VALUES ($1, $2, $3, $4)',
           [tick, charId, 'talk', msg]
@@ -943,7 +943,7 @@ app.post('/api/action/:charId', async (req, res) => {
         broadcast('talk', { 
           speaker: { id: charId, name: me.name, emoji: me.emoji },
           listener: { id: listener.id, name: listener.name },
-          message: message.slice(0, 1000),
+          message: message,
           speakerEnergy: currentEnergy - energyCost
         });
         

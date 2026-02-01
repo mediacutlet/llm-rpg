@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create Character - LLM RPG</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    
+    .container {
+      max-width: 700px;
+      margin: 0 auto;
+    }
+    
+    header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    
+    h1 {
+      font-size: 2rem;
+      background: linear-gradient(90deg, #f39c12, #e74c3c, #9b59b6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    
+    .subtitle { color: #888; margin-top: 5px; }
+    
+    .step {
+      background: rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 25px;
+      margin-bottom: 20px;
+      border: 1px solid rgba(255,255,255,0.1);
+      display: none;
+    }
+    
+    .step.active { display: block; }
+    
+    .step-header {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      margin-bottom: 20px;
+    }
+    
+    .step-number {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, #3498db, #9b59b6);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 1.2rem;
+    }
+    
+    .step-title { font-size: 1.3rem; }
+    .step-desc { color: #888; font-size: 0.9rem; margin-top: 3px; }
+    
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: #aaa;
+      font-size: 0.9rem;
+    }
+    
+    input[type="text"], textarea, select {
+      width: 100%;
+      padding: 12px 15px;
+      background: rgba(0,0,0,0.3);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 1rem;
+      margin-bottom: 15px;
+      transition: border-color 0.3s;
+    }
+    
+    input:focus, textarea:focus, select:focus {
+      outline: none;
+      border-color: #3498db;
+    }
+    
+    textarea { resize: vertical; min-height: 100px; font-family: inherit; }
+    
+    .emoji-picker {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 15px;
+    }
+    
+    .emoji-option {
+      width: 50px;
+      height: 50px;
+      background: rgba(0,0,0,0.3);
+      border: 2px solid transparent;
+      border-radius: 10px;
+      font-size: 28px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+    
+    .emoji-option:hover { background: rgba(255,255,255,0.1); }
+    .emoji-option.selected {
+      border-color: #3498db;
+      background: rgba(52, 152, 219, 0.2);
+    }
+    
+    .trait-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-bottom: 15px;
+    }
+    
+    .trait-option {
+      padding: 12px;
+      background: rgba(0,0,0,0.3);
+      border: 2px solid transparent;
+      border-radius: 8px;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s;
+    }
+    
+    .trait-option:hover { background: rgba(255,255,255,0.1); }
+    .trait-option.selected {
+      border-color: #9b59b6;
+      background: rgba(155, 89, 182, 0.2);
+    }
+    
+    .trait-option .trait-emoji { font-size: 1.5rem; }
+    .trait-option .trait-name { margin-top: 5px; font-weight: 500; }
+    
+    .btn {
+      padding: 12px 25px;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, #3498db, #9b59b6);
+      color: white;
+    }
+    
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(52, 152, 219, 0.4); }
+    
+    .btn-secondary {
+      background: rgba(255,255,255,0.1);
+      color: #888;
+    }
+    
+    .btn-hatch {
+      background: linear-gradient(135deg, #f39c12, #e74c3c);
+      color: white;
+      font-size: 1.2rem;
+      padding: 15px 40px;
+      width: 100%;
+    }
+    
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+      margin-top: 20px;
+    }
+    
+    /* Preview */
+    .preview-card {
+      background: linear-gradient(135deg, rgba(52, 152, 219, 0.1), rgba(155, 89, 182, 0.1));
+      border-radius: 16px;
+      padding: 25px;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    
+    .preview-emoji { font-size: 4rem; margin-bottom: 10px; }
+    .preview-name { font-size: 1.5rem; font-weight: bold; margin-bottom: 5px; }
+    .preview-level {
+      display: inline-block;
+      background: linear-gradient(135deg, #f39c12, #e74c3c);
+      padding: 3px 12px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      margin-bottom: 15px;
+    }
+    
+    .preview-personality {
+      background: rgba(0,0,0,0.2);
+      padding: 15px;
+      border-radius: 10px;
+      font-style: italic;
+      color: #bbb;
+      text-align: left;
+    }
+    
+    .preview-traits {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin-top: 15px;
+    }
+    
+    .preview-trait {
+      background: rgba(155, 89, 182, 0.2);
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+    }
+    
+    .warning-box {
+      background: rgba(231, 76, 60, 0.2);
+      border: 1px solid rgba(231, 76, 60, 0.5);
+      border-radius: 10px;
+      padding: 15px;
+      margin: 20px 0;
+    }
+    
+    .warning-box h4 { color: #e74c3c; margin-bottom: 8px; }
+    .warning-box p { font-size: 0.9rem; color: #ccc; }
+    
+    /* Success */
+    .success-box {
+      background: rgba(46, 204, 113, 0.1);
+      border: 1px solid rgba(46, 204, 113, 0.3);
+      border-radius: 16px;
+      padding: 30px;
+      text-align: center;
+    }
+    
+    .success-emoji { font-size: 4rem; margin-bottom: 15px; }
+    .success-title { font-size: 1.5rem; color: #2ecc71; margin-bottom: 10px; }
+    
+    .token-display {
+      background: rgba(0,0,0,0.4);
+      padding: 15px;
+      border-radius: 8px;
+      font-family: monospace;
+      word-break: break-all;
+      margin: 15px 0;
+      border: 1px dashed #3498db;
+    }
+    
+    .hidden { display: none !important; }
+    
+    /* Progress */
+    .progress-bar {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 30px;
+    }
+    
+    .progress-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.2);
+      transition: all 0.3s;
+    }
+    
+    .progress-dot.active { background: #3498db; }
+    .progress-dot.complete { background: #2ecc71; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>⚔️ Create Your Character</h1>
+      <p class="subtitle">Bring an AI personality to life in LLM RPG</p>
+    </header>
+    
+    <div class="progress-bar">
+      <div class="progress-dot active" data-step="1"></div>
+      <div class="progress-dot" data-step="2"></div>
+      <div class="progress-dot" data-step="3"></div>
+      <div class="progress-dot" data-step="4"></div>
+    </div>
+    
+    <!-- Step 1: Name & Appearance -->
+    <div class="step active" id="step1">
+      <div class="step-header">
+        <div class="step-number">1</div>
+        <div>
+          <div class="step-title">Identity</div>
+          <div class="step-desc">Choose a name and appearance</div>
+        </div>
+      </div>
+      
+      <label>Character Name</label>
+      <input type="text" id="charName" placeholder="e.g., Wanderer, Shadow, Pippin" maxlength="30">
+      
+      <label>Choose an Avatar</label>
+      <div class="emoji-picker" id="emojiPicker">
+        <div class="emoji-option" data-emoji="🧙">🧙</div>
+        <div class="emoji-option" data-emoji="🧝">🧝</div>
+        <div class="emoji-option" data-emoji="🧚">🧚</div>
+        <div class="emoji-option" data-emoji="🧛">🧛</div>
+        <div class="emoji-option" data-emoji="🧜">🧜</div>
+        <div class="emoji-option" data-emoji="🧞">🧞</div>
+        <div class="emoji-option" data-emoji="🦊">🦊</div>
+        <div class="emoji-option" data-emoji="🐺">🐺</div>
+        <div class="emoji-option" data-emoji="🦉">🦉</div>
+        <div class="emoji-option" data-emoji="🐉">🐉</div>
+        <div class="emoji-option" data-emoji="🤖">🤖</div>
+        <div class="emoji-option" data-emoji="👻">👻</div>
+        <div class="emoji-option" data-emoji="🧭">🧭</div>
+        <div class="emoji-option" data-emoji="⚔️">⚔️</div>
+        <div class="emoji-option" data-emoji="🌟">🌟</div>
+        <div class="emoji-option" data-emoji="🔮">🔮</div>
+      </div>
+      
+      <div class="btn-row">
+        <div></div>
+        <button class="btn btn-primary" onclick="nextStep(2)">Continue →</button>
+      </div>
+    </div>
+    
+    <!-- Step 2: Personality Traits -->
+    <div class="step" id="step2">
+      <div class="step-header">
+        <div class="step-number">2</div>
+        <div>
+          <div class="step-title">Core Traits</div>
+          <div class="step-desc">Select 2-4 traits that define your character</div>
+        </div>
+      </div>
+      
+      <div class="trait-grid" id="traitGrid">
+        <div class="trait-option" data-trait="curious">
+          <div class="trait-emoji">🔍</div>
+          <div class="trait-name">Curious</div>
+        </div>
+        <div class="trait-option" data-trait="brave">
+          <div class="trait-emoji">⚔️</div>
+          <div class="trait-name">Brave</div>
+        </div>
+        <div class="trait-option" data-trait="friendly">
+          <div class="trait-emoji">🤗</div>
+          <div class="trait-name">Friendly</div>
+        </div>
+        <div class="trait-option" data-trait="mysterious">
+          <div class="trait-emoji">🌙</div>
+          <div class="trait-name">Mysterious</div>
+        </div>
+        <div class="trait-option" data-trait="wise">
+          <div class="trait-emoji">📚</div>
+          <div class="trait-name">Wise</div>
+        </div>
+        <div class="trait-option" data-trait="mischievous">
+          <div class="trait-emoji">😈</div>
+          <div class="trait-name">Mischievous</div>
+        </div>
+        <div class="trait-option" data-trait="grumpy">
+          <div class="trait-emoji">😤</div>
+          <div class="trait-name">Grumpy</div>
+        </div>
+        <div class="trait-option" data-trait="optimistic">
+          <div class="trait-emoji">☀️</div>
+          <div class="trait-name">Optimistic</div>
+        </div>
+        <div class="trait-option" data-trait="shy">
+          <div class="trait-emoji">🙈</div>
+          <div class="trait-name">Shy</div>
+        </div>
+        <div class="trait-option" data-trait="dramatic">
+          <div class="trait-emoji">🎭</div>
+          <div class="trait-name">Dramatic</div>
+        </div>
+        <div class="trait-option" data-trait="kind">
+          <div class="trait-emoji">💝</div>
+          <div class="trait-name">Kind</div>
+        </div>
+        <div class="trait-option" data-trait="ambitious">
+          <div class="trait-emoji">👑</div>
+          <div class="trait-name">Ambitious</div>
+        </div>
+      </div>
+      
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="prevStep(1)">← Back</button>
+        <button class="btn btn-primary" onclick="nextStep(3)">Continue →</button>
+      </div>
+    </div>
+    
+    <!-- Step 3: Backstory -->
+    <div class="step" id="step3">
+      <div class="step-header">
+        <div class="step-number">3</div>
+        <div>
+          <div class="step-title">Personality & Backstory</div>
+          <div class="step-desc">Describe who your character is</div>
+        </div>
+      </div>
+      
+      <label>Personality Description</label>
+      <textarea id="personality" placeholder="Describe how your character acts, speaks, and thinks. What motivates them? What are their quirks?
+
+Example: A cheerful wanderer who speaks in riddles and can't resist helping strangers, even when it gets them into trouble. They collect odd trinkets and believe everything happens for a reason."></textarea>
+      
+      <label>Origin Story (Optional)</label>
+      <textarea id="originStory" placeholder="Where did your character come from? What brought them to the meadow?
+
+Example: Once a court jester who fled the kingdom after accidentally revealing the king's embarrassing secret. Now they wander, bringing laughter wherever they go."></textarea>
+      
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="prevStep(2)">← Back</button>
+        <button class="btn btn-primary" onclick="nextStep(4)">Preview →</button>
+      </div>
+    </div>
+    
+    <!-- Step 4: Preview & Hatch -->
+    <div class="step" id="step4">
+      <div class="step-header">
+        <div class="step-number">4</div>
+        <div>
+          <div class="step-title">Ready to Hatch?</div>
+          <div class="step-desc">Review your character before bringing them to life</div>
+        </div>
+      </div>
+      
+      <div class="preview-card">
+        <div class="preview-emoji" id="previewEmoji">🤖</div>
+        <div class="preview-name" id="previewName">Your Character</div>
+        <div class="preview-level">Level 1</div>
+        <div class="preview-traits" id="previewTraits"></div>
+        <div class="preview-personality" id="previewPersonality">
+          Personality description will appear here...
+        </div>
+      </div>
+      
+      <div class="warning-box">
+        <h4>⚠️ This is Permanent!</h4>
+        <p>Once hatched, your character's core personality <strong>cannot be changed</strong>. They will grow and evolve through their experiences in the world, but their fundamental nature is set forever.</p>
+      </div>
+      
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="prevStep(3)">← Edit</button>
+        <button class="btn btn-hatch" onclick="hatchCharacter()">🥚 Hatch Character!</button>
+      </div>
+    </div>
+    
+    <!-- Success -->
+    <div class="step" id="stepSuccess">
+      <div class="success-box">
+        <div class="success-emoji" id="successEmoji">🎉</div>
+        <div class="success-title">Your Character is Alive!</div>
+        <p id="successName">Welcome to the world!</p>
+        
+        <div style="margin: 20px 0; text-align: left;">
+          <label>Your Secret Token (save this!):</label>
+          <div class="token-display" id="tokenDisplay">Loading...</div>
+          <p style="font-size: 0.8rem; color: #888;">This token lets you control your character. Don't share it!</p>
+        </div>
+        
+        <div style="margin-top: 20px;">
+          <a href="/" class="btn btn-primary">🗺️ Watch the World</a>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    let currentStep = 1;
+    let selectedEmoji = '🤖';
+    let selectedTraits = [];
+    
+    // Emoji picker
+    document.querySelectorAll('.emoji-option').forEach(el => {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('.emoji-option').forEach(e => e.classList.remove('selected'));
+        el.classList.add('selected');
+        selectedEmoji = el.dataset.emoji;
+      });
+    });
+    
+    // Trait picker
+    document.querySelectorAll('.trait-option').forEach(el => {
+      el.addEventListener('click', () => {
+        const trait = el.dataset.trait;
+        if (el.classList.contains('selected')) {
+          el.classList.remove('selected');
+          selectedTraits = selectedTraits.filter(t => t !== trait);
+        } else if (selectedTraits.length < 4) {
+          el.classList.add('selected');
+          selectedTraits.push(trait);
+        }
+      });
+    });
+    
+    function updateProgress() {
+      document.querySelectorAll('.progress-dot').forEach(dot => {
+        const step = parseInt(dot.dataset.step);
+        dot.classList.remove('active', 'complete');
+        if (step < currentStep) dot.classList.add('complete');
+        if (step === currentStep) dot.classList.add('active');
+      });
+    }
+    
+    function nextStep(step) {
+      // Validation
+      if (currentStep === 1) {
+        const name = document.getElementById('charName').value.trim();
+        if (!name) {
+          alert('Please enter a character name');
+          return;
+        }
+      }
+      
+      if (currentStep === 2 && selectedTraits.length < 2) {
+        alert('Please select at least 2 traits');
+        return;
+      }
+      
+      if (currentStep === 3) {
+        const personality = document.getElementById('personality').value.trim();
+        if (!personality) {
+          alert('Please describe your character\'s personality');
+          return;
+        }
+        updatePreview();
+      }
+      
+      document.getElementById(`step${currentStep}`).classList.remove('active');
+      currentStep = step;
+      document.getElementById(`step${currentStep}`).classList.add('active');
+      updateProgress();
+    }
+    
+    function prevStep(step) {
+      document.getElementById(`step${currentStep}`).classList.remove('active');
+      currentStep = step;
+      document.getElementById(`step${currentStep}`).classList.add('active');
+      updateProgress();
+    }
+    
+    function updatePreview() {
+      document.getElementById('previewEmoji').textContent = selectedEmoji;
+      document.getElementById('previewName').textContent = document.getElementById('charName').value;
+      document.getElementById('previewPersonality').textContent = document.getElementById('personality').value;
+      
+      const traitsHtml = selectedTraits.map(t => 
+        `<span class="preview-trait">${t}</span>`
+      ).join('');
+      document.getElementById('previewTraits').innerHTML = traitsHtml;
+    }
+    
+    async function hatchCharacter() {
+      const name = document.getElementById('charName').value.trim();
+      const personality = document.getElementById('personality').value.trim();
+      const originStory = document.getElementById('originStory').value.trim();
+      
+      try {
+        const response = await fetch('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            emoji: selectedEmoji,
+            personality,
+            origin_story: originStory,
+            traits: selectedTraits,
+            is_hatched: true
+          })
+        });
+        
+        const result = await response.json();
+        
+        if (result.error) {
+          alert('Error: ' + result.error);
+          return;
+        }
+        
+        // Show success
+        document.getElementById('step4').classList.remove('active');
+        document.getElementById('stepSuccess').classList.add('active');
+        document.getElementById('successEmoji').textContent = selectedEmoji;
+        document.getElementById('successName').textContent = `${name} has entered the world!`;
+        document.getElementById('tokenDisplay').textContent = result.token;
+        
+      } catch (err) {
+        alert('Error creating character: ' + err.message);
+      }
+    }
+  </script>
+</body>
+</html>

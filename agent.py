@@ -411,23 +411,17 @@ TOPICS: [topic1, topic2, topic3]"""
             
             # Skip if already in cooldown (already said goodbye)
             if other_id not in self.goodbye_cooldown:
-                # Get exchange count from SERVER (survives agent restarts and is more reliable)
-                fatigue = other.get("conversationFatigue", {})
-                server_exchanges = int(fatigue.get("exchanges", 0) or 0)
-                
-                # Also check local memory for THIS session
+                # Use LOCAL memory for THIS session's exchange count
+                # Server data is stale and persists across sessions
                 local_messages = self.conversation_memory.get(other_id, [])
-                local_count = len(local_messages)
-                
-                # Use whichever is SMALLER (prevents false positives from stale data)
-                exchange_count = min(server_exchanges, local_count) if local_count > 0 else server_exchanges
+                exchange_count = len(local_messages)
                 
                 # Reasons to leave:
-                # - Critically low energy (<30) or hunger (<25) - urgent, leave after 2 exchanges  
-                # - Moderately low energy (<40) or hunger (<35) - leave after 5 exchanges
+                # - Critically low energy (<30) or hunger (<25) - urgent, leave after 3 exchanges  
+                # - Moderately low energy (<40) or hunger (<35) - leave after 6 exchanges
                 # - Had 10+ exchanges - natural conversation endpoint
-                urgent_need = (energy < 30 or hunger < 25) and exchange_count >= 2
-                moderate_need = (energy < 40 or hunger < 35) and exchange_count >= 5
+                urgent_need = (energy < 30 or hunger < 25) and exchange_count >= 3
+                moderate_need = (energy < 40 or hunger < 35) and exchange_count >= 6
                 talked_enough = exchange_count >= 10
                 
                 should_leave = urgent_need or moderate_need or talked_enough
@@ -710,20 +704,22 @@ Say goodbye warmly. Use phrases like "goodbye", "farewell", "I should go explore
                         last_topic = past_summaries[-1].get("title", "")
                         memory_hint = f"\nYou remember last time you talked about: {last_topic}"
                     
-                    prompt = f"""You are {self.name}.
+                    prompt = f"""You are {self.name}, greeting {other_name}.
 Personality: {self.personality[:300]}
 {memory_context}
 You see {other_name}, whom you've talked to before!{memory_hint}
 
-Greet them warmly in 1-2 sentences. You might reference something from your past conversations or just say a friendly hello:"""
+Speak directly as {self.name} in first person. Greet them warmly in 1-2 sentences:
+
+{self.name} says:"""
                 else:
                     # First time meeting - introduce yourself
-                    prompt = f"""You are {self.name}.
+                    prompt = f"""You are {self.name}, meeting {other_name} for the first time.
 Personality: {self.personality[:300]}
 
-You see {other_name} - you've never met them before! Introduce yourself.
+Speak directly as {self.name} in first person. Introduce yourself warmly in 1-2 sentences:
 
-Greet them warmly in 1-2 short sentences. Say your name and maybe ask how they're doing:"""
+{self.name} says:"""
                 return prompt, "talk", other_id
             
             # Get topics we've covered to suggest variety
@@ -750,33 +746,33 @@ Greet them warmly in 1-2 short sentences. Say your name and maybe ask how they'r
                 if our_last:
                     repetition_warning = f'\n⚠️ You already said: "{our_last}..." - DO NOT repeat this!'
                 
-                prompt = f"""You are {self.name}. 
+                prompt = f"""You are {self.name}, speaking directly to {other_name}.
 Personality: {self.personality[:300]}
 {memory_context if memory_context else ""}
 {convo_history}
 
-{other_name} just said: "{last_said_to_me[:300]}"
+{other_name} just said to you: "{last_said_to_me[:300]}"
 {repetition_warning}
 
-RULES:
-1. {"ANSWER THEIR QUESTION FIRST!" if asked_question else "React to what they said."}
-2. Keep it to 2-3 short sentences MAX
-3. Just dialogue - NO asterisks, NO actions
+RESPOND AS {self.name.upper()} - speak in FIRST PERSON ("I", "me", "my").
+DO NOT narrate or describe actions. Just say what you would say out loud.
+{"ANSWER THEIR QUESTION!" if asked_question else "React to what they said."}
+Keep it to 2-3 sentences.
 
-What you say:"""
+{self.name} says:"""
             else:
-                prompt = f"""You are {self.name}.
+                prompt = f"""You are {self.name}, speaking directly to {other_name}.
 Personality: {self.personality[:300]}
 {memory_context if memory_context else ""}
 {convo_history}
 
-You see {other_name}. {"Continue your conversation." if convo_history else "Say hello!"}
+You see {other_name}. {"Continue your conversation." if convo_history else "Greet them!"}
 
-RULES:
-1. Keep it to 2-3 short sentences MAX
-2. Just dialogue - NO asterisks, NO actions
+RESPOND AS {self.name.upper()} - speak in FIRST PERSON ("I", "me", "my").
+DO NOT narrate or describe actions. Just say what you would say out loud.
+Keep it to 2-3 sentences.
 
-What you say:"""
+{self.name} says:"""
             
             return prompt, "talk", other_id
         
@@ -861,6 +857,21 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if message.lower().startswith(prefix.lower()):
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
+            
+            # Clean up excessive asterisks - this model goes overboard
+            # Remove asterisks around individual words in dialogue (not actions)
+            # Keep *action phrases* but remove *"text"* patterns
+            message = re.sub(r'\*"', '"', message)  # *" -> "
+            message = re.sub(r'"\*', '"', message)  # "* -> "
+            message = re.sub(r'\*\*+', '*', message)  # ** or more -> *
+            
+            # If the whole message is wrapped in asterisks, remove them
+            if message.startswith('*') and message.endswith('*') and message.count('*') == 2:
+                message = message[1:-1]
+            
+            # Remove asterisks around single words that aren't actions
+            # (keep things like *grins* but remove *x* or *do* or *solve*)
+            message = re.sub(r'\*(\w{1,4})\*', r'\1', message)  # Short words aren't actions
             
             # Clean up extra whitespace
             message = re.sub(r'\s+', ' ', message).strip()

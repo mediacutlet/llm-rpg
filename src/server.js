@@ -261,6 +261,102 @@ function getMoveToward(dx, dy) {
   return moves;
 }
 
+// Generate a visual map of surroundings (6-tile radius)
+function generateVisualMap(myX, myY, characters, objects, worldWidth, worldHeight) {
+  const radius = 6;
+  const size = radius * 2 + 1; // 13x13 grid
+  
+  // Initialize grid with terrain
+  const grid = [];
+  for (let row = 0; row < size; row++) {
+    grid[row] = [];
+    for (let col = 0; col < size; col++) {
+      const worldX = myX - radius + col;
+      const worldY = myY - radius + row;
+      
+      // Check boundaries
+      if (worldX < 0 || worldX >= worldWidth || worldY < 0 || worldY >= worldHeight) {
+        grid[row][col] = '##'; // Wall/boundary
+      } else {
+        grid[row][col] = '··'; // Empty grass
+      }
+    }
+  }
+  
+  // Place objects
+  for (const obj of objects) {
+    const gridX = obj.x - myX + radius;
+    const gridY = obj.y - myY + radius;
+    if (gridX >= 0 && gridX < size && gridY >= 0 && gridY < size) {
+      grid[gridY][gridX] = obj.emoji?.slice(0, 2) || '??';
+    }
+  }
+  
+  // Place characters
+  for (const char of characters) {
+    const gridX = char.x - myX + radius;
+    const gridY = char.y - myY + radius;
+    if (gridX >= 0 && gridX < size && gridY >= 0 && gridY < size) {
+      grid[gridY][gridX] = char.emoji?.slice(0, 2) || '👤';
+    }
+  }
+  
+  // Place self at center
+  grid[radius][radius] = '⭐';
+  
+  // Build text representation with coordinates
+  let map = '\n📍 YOUR SURROUNDINGS (6-tile view):\n';
+  map += '   '; 
+  // Column headers (relative X: -6 to +6)
+  for (let col = 0; col < size; col++) {
+    const relX = col - radius;
+    if (relX === 0) map += ' ⬇ ';
+    else if (col % 2 === 0) map += `${relX >= 0 ? '+' : ''}${relX}`.padStart(3);
+    else map += '   ';
+  }
+  map += '\n';
+  
+  for (let row = 0; row < size; row++) {
+    const relY = row - radius;
+    // Row label
+    if (relY === 0) map += '➡️ ';
+    else map += '   ';
+    
+    map += grid[row].join(' ') + '\n';
+  }
+  
+  // Legend
+  map += '\nLegend: ⭐=You, ##=Boundary, ··=Empty\n';
+  
+  // List what's visible
+  const visible = [];
+  for (const char of characters) {
+    const dx = char.x - myX;
+    const dy = char.y - myY;
+    if (Math.abs(dx) <= radius && Math.abs(dy) <= radius) {
+      const dirHint = [];
+      if (dy < 0) dirHint.push('north');
+      if (dy > 0) dirHint.push('south');
+      if (dx > 0) dirHint.push('east');
+      if (dx < 0) dirHint.push('west');
+      visible.push(`${char.emoji} ${char.name} at (${dx >= 0 ? '+' : ''}${dx}, ${dy >= 0 ? '+' : ''}${dy}) - go ${dirHint.join(' then ') || 'nowhere, RIGHT HERE!'}`);
+    }
+  }
+  for (const obj of objects) {
+    const dx = obj.x - myX;
+    const dy = obj.y - myY;
+    if (Math.abs(dx) <= radius && Math.abs(dy) <= radius) {
+      visible.push(`${obj.emoji} ${obj.name} at (${dx >= 0 ? '+' : ''}${dx}, ${dy >= 0 ? '+' : ''}${dy})`);
+    }
+  }
+  
+  if (visible.length > 0) {
+    map += '\nVisible:\n' + visible.map(v => `  ${v}`).join('\n') + '\n';
+  }
+  
+  return map;
+}
+
 async function canAct(charId) {
   const result = await pool.query(`
     SELECT c.turn_interval, c.last_action_tick, w.tick
@@ -490,7 +586,7 @@ app.get('/api/look/:charId', async (req, res) => {
     // Get nearby objects (within 5 tiles)
     const objects = await pool.query(`
       SELECT * FROM objects
-      WHERE ABS(x - $1) <= 5 AND ABS(y - $2) <= 5
+      WHERE ABS(x - $1) <= 6 AND ABS(y - $2) <= 6
     `, [me.x, me.y]);
     
     // Get recent memories
@@ -596,6 +692,15 @@ app.get('/api/look/:charId', async (req, res) => {
       output += '\n💬 Someone is close enough to TALK!';
     }
     
+    // Generate visual map of surroundings
+    const visualMap = generateVisualMap(
+      me.x, me.y, 
+      others.rows, 
+      objects.rows, 
+      width, height
+    );
+    output += visualMap;
+    
     // Check if can act
     const actAllowed = await canAct(charId);
     
@@ -622,6 +727,7 @@ app.get('/api/look/:charId', async (req, res) => {
       needsRest: energy < 30,
       validMoves: open,
       blockedMoves: blocked,
+      visualMap,
       textDescription: output
     });
   } catch (err) {

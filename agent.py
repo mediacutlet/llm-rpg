@@ -249,7 +249,7 @@ class LLMRPGAgent:
             if len(unique_positions) <= 2 and len(recent_positions) >= 5:
                 history_context += f"\n🚨 STUCK ALERT: You've been in the same 1-2 spots for {len(recent_positions)} turns! Move somewhere completely NEW!\n"
         
-        # Check conversation fatigue with nearby characters
+        # Check conversation fatigue with nearby characters (just for display info)
         conversation_warning = ""
         if nearby_chars:
             for char in nearby_chars:
@@ -259,12 +259,14 @@ class LLMRPGAgent:
                 current_tick = int(state.get("world", {}).get("tick", 0) or 0)
                 
                 if cooldown > current_tick:
-                    conversation_warning = f"\n⛔ CONVERSATION BREAK: You've talked to {char['name']} too much! You MUST explore elsewhere for {cooldown - current_tick} ticks before chatting again.\n"
-                    can_talk = False  # Force no talking
+                    # Server has cooldown, but DON'T override can_talk here
+                    # Let the server reject the action if we try to talk
+                    # This prevents the "approach adjacent person" bug
+                    conversation_warning = f"\n⛔ Note: Server cooldown active ({cooldown - current_tick} ticks remaining)\n"
                 elif exchanges >= 10:
-                    conversation_warning = f"\n😴 CONVERSATION STALE: You've said everything to {char['name']} for now. No more XP from talking. Consider exploring!\n"
+                    conversation_warning = f"\n😴 Conversation getting stale with {char['name']}.\n"
                 elif exchanges >= 5:
-                    conversation_warning = f"\n💤 CONVERSATION WINDING DOWN: You've talked with {char['name']} a lot ({exchanges} exchanges). XP rewards diminishing.\n"
+                    conversation_warning = f"\n💤 ({exchanges} exchanges so far)\n"
         
         # Build conversation context
         convo_context = ""
@@ -308,7 +310,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
         if self.must_leave:
             # Set cooldown so we don't re-engage immediately
             if self.leaving_from:
-                self.goodbye_cooldown[self.leaving_from] = 20  # 20 turns before we can talk to them again
+                self.goodbye_cooldown[self.leaving_from] = 30  # 30 turns before we can talk to them again
             self.must_leave = False
             self.leaving_from = None
             
@@ -316,7 +318,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             # random imported at top
             if valid_moves:
                 self.traveling_direction = random.choice(valid_moves)
-                self.traveling_turns = 6  # Keep going this direction for 6 turns
+                self.traveling_turns = 10  # Keep going this direction for 10 turns
             
             prompt = f"""You are {self.name}, exploring the world.
 {history_context}
@@ -492,20 +494,43 @@ What you say:"""
         
         elif nearby_chars:
             other = nearby_chars[0]
+            other_id = other.get("id", other["name"])
             directions = other.get("direction", valid_moves)
             
-            prompt = f"""You are {self.name}, exploring the world. You see {other['name']} in the distance!
+            # If we're in goodbye cooldown with this person, DON'T approach - explore elsewhere
+            if other_id in self.goodbye_cooldown:
+                # Pick opposite direction from them
+                avoid_directions = []
+                for d in directions:
+                    opposites = {'north': 'south', 'south': 'north', 'east': 'west', 'west': 'east'}
+                    if opposites.get(d) in valid_moves:
+                        avoid_directions.append(opposites[d])
+                if not avoid_directions:
+                    avoid_directions = [d for d in valid_moves if d not in directions]
+                if not avoid_directions:
+                    avoid_directions = valid_moves
+                
+                prompt = f"""You are {self.name}, exploring the world.
 {history_context}
 {text_desc}
 
-GOAL: Move toward {other['name']} to meet them!
+You recently talked with {other['name']}. Explore somewhere NEW!
+Go AWAY from them - try: {', '.join(avoid_directions)}
 ✅ Valid moves: {', '.join(valid_moves)}
-❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
-➡️ To approach {other['name']}, try: {', '.join(directions)}
 
-IMPORTANT: Check your action history above! Don't repeat failed moves!
+Reply with ONLY: move {avoid_directions[0] if avoid_directions else 'south'}"""
+                return prompt, "move", None
+            
+            prompt = f"""You are {self.name}, exploring the world. You see {other['name']} in the distance!
+{text_desc}
 
-Reply with ONLY one of: move north | move south | move east | move west"""
+🎯 GOAL: Go meet {other['name']}!
+📍 They are to the {' and '.join(directions)} of you.
+✅ Valid moves: {', '.join(valid_moves)}
+
+To reach them, move {directions[0].upper()} now!
+
+Reply with ONLY: move {directions[0]}"""
             
             return prompt, "move", None
         
@@ -633,7 +658,16 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 # Build prompt with action history
                 prompt, expected_type, talk_target_id = self.build_prompt(state)
                 
-                print(f"🤔 Thinking...")
+                # Debug: show decision state
+                nearby = state.get("nearbyCharacters", [])
+                if nearby:
+                    for n in nearby:
+                        nid = n.get("id", n["name"])
+                        in_cooldown = nid in self.goodbye_cooldown
+                        cd_remaining = self.goodbye_cooldown.get(nid, 0)
+                        print(f"   👁️ See {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining})")
+                
+                print(f"🤔 Thinking... (mode: {expected_type})")
                 response = ollama_generate(prompt, self.model)
                 
                 # Parse and execute
@@ -671,6 +705,9 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         print(f"   💤 Find a campfire or cottage to rest!")
                     if result.get('conversationFatigue'):
                         print(f"   😴 Take a break from this conversation!")
+                        # Server rejected talk - we should move away
+                        self.must_leave = True
+                        self.leaving_from = talk_target_id
                     history_entry = {
                         "turn": turn,
                         "action": action_desc,

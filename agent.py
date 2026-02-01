@@ -66,6 +66,20 @@ class LLMRPGAgent:
         # Action history for memory
         self.action_history = []  # List of {"action": ..., "result": ..., "position": ...}
         self.max_history = 30
+        
+        # Conversation memory - track what WE said to avoid repetition
+        self.conversation_memory = {}  # {other_char_id: [list of our messages]}
+        self.max_convo_memory = 20  # Remember last 20 things we said to each person
+        
+        # Topic tracking
+        self.discussed_topics = {}  # {other_char_id: set of topic keywords}
+        
+        # Force leave after goodbye
+        self.must_leave = False
+        self.leaving_from = None  # ID of character we said goodbye to
+        
+        # Post-goodbye cooldown - don't talk to same person for X turns
+        self.goodbye_cooldown = {}  # {char_id: turns_remaining}
     
     def get_character_info(self) -> bool:
         """Fetch character info from server using token."""
@@ -81,12 +95,91 @@ class LLMRPGAgent:
                 self.traits = data.get('traits', [])
                 return True
             else:
-                print(f"❌ Could not authenticate. Check your token.")
-                print(f"   Server response: {r.text}")
+                print(f"❌ Error fetching character: {r.status_code}")
+                print(r.text)
                 return False
         except Exception as e:
-            print(f"❌ Could not connect to server: {e}")
+            print(f"❌ Connection error: {e}")
             return False
+    
+    def remember_our_message(self, other_id: str, message: str):
+        """Track what we said to avoid repetition."""
+        if other_id not in self.conversation_memory:
+            self.conversation_memory[other_id] = []
+        
+        self.conversation_memory[other_id].append(message)
+        
+        # Keep only last N messages
+        if len(self.conversation_memory[other_id]) > self.max_convo_memory:
+            self.conversation_memory[other_id] = self.conversation_memory[other_id][-self.max_convo_memory:]
+        
+        # Extract and track topics
+        self.extract_topics(other_id, message)
+    
+    def extract_topics(self, other_id: str, message: str):
+        """Extract key topics from a message to avoid repetition."""
+        if other_id not in self.discussed_topics:
+            self.discussed_topics[other_id] = set()
+        
+        # Simple keyword extraction
+        keywords = ['coffee', 'quantum', 'glitch', 'code', 'debug', 'universe', 
+                   'loop', 'firewall', 'static', 'rewrite', 'chaos', 'paradox',
+                   'screen', 'firmware', 'syntax', 'reboot', 'matrix', 'system']
+        
+        message_lower = message.lower()
+        for kw in keywords:
+            if kw in message_lower:
+                self.discussed_topics[other_id].add(kw)
+    
+    def get_conversation_context(self, other_id: str, other_name: str) -> str:
+        """Build context about our conversation history to avoid repetition."""
+        context = ""
+        
+        # What we've already said
+        if other_id in self.conversation_memory and self.conversation_memory[other_id]:
+            recent = self.conversation_memory[other_id][-5:]  # Last 5 things we said
+            context += f"\n🚫 THINGS YOU ALREADY SAID TO {other_name.upper()} (DO NOT REPEAT THESE):\n"
+            for msg in recent:
+                # Truncate for prompt space
+                context += f'  - "{msg[:80]}..."\n'
+        
+        # Topics we've covered
+        if other_id in self.discussed_topics and self.discussed_topics[other_id]:
+            topics = list(self.discussed_topics[other_id])
+            context += f"\n📝 TOPICS ALREADY DISCUSSED: {', '.join(topics)}\n"
+            context += "→ Try a COMPLETELY DIFFERENT topic! Ask about their past, their dreams, the world around you, etc.\n"
+        
+        return context
+    
+    def suggest_new_topics(self, other_id: str) -> str:
+        """Suggest topics we haven't discussed yet."""
+        all_topics = [
+            'your past', 'your dreams', 'this place', 'where you came from',
+            'what you seek', 'favorite memory', 'fears', 'hopes', 
+            'the weather', 'nearby landmarks', 'other travelers',
+            'food', 'music', 'stories', 'adventures', 'home'
+        ]
+        
+        discussed = self.discussed_topics.get(other_id, set())
+        
+        # Filter out topics similar to what we've discussed
+        available = []
+        for topic in all_topics:
+            # Check if any discussed keyword is in this topic
+            dominated = False
+            for kw in discussed:
+                if kw in topic.lower():
+                    dominated = True
+                    break
+            if not dominated:
+                available.append(topic)
+        
+        if not available:
+            available = ['something completely unexpected', 'a random observation', 'saying goodbye']
+        
+        import random
+        random.shuffle(available)
+        return ', '.join(available[:3])
     
     def look(self) -> dict:
         """Get character's view of the world."""
@@ -153,9 +246,9 @@ class LLMRPGAgent:
         if nearby_chars:
             for char in nearby_chars:
                 fatigue = char.get("conversationFatigue", {})
-                exchanges = fatigue.get("exchanges", 0)
-                cooldown = fatigue.get("cooldownUntil", 0)
-                current_tick = state.get("world", {}).get("tick", 0)
+                exchanges = int(fatigue.get("exchanges", 0) or 0)
+                cooldown = int(fatigue.get("cooldownUntil", 0) or 0)
+                current_tick = int(state.get("world", {}).get("tick", 0) or 0)
                 
                 if cooldown > current_tick:
                     conversation_warning = f"\n⛔ CONVERSATION BREAK: You've talked to {char['name']} too much! You MUST explore elsewhere for {cooldown - current_tick} ticks before chatting again.\n"
@@ -186,7 +279,7 @@ There is a {closest_rest} nearby where you can rest.
 Use: interact {closest_rest.lower().split()[0]}
 
 Reply with ONLY: interact campfire OR interact cottage OR interact pond"""
-            return prompt, "rest"
+            return prompt, "rest", None
         
         # PRIORITY 2: Need rest but no spot nearby - find one
         if needs_rest:
@@ -201,7 +294,7 @@ Move toward a rest spot. Look for 🔥 campfire, 🏠 cottage, or 💧 pond.
 ❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
 
 Reply with ONLY one of: move north | move south | move east | move west"""
-            return prompt, "move"
+            return prompt, "move", None
         
         # PRIORITY 3: In conversation cooldown - must explore
         if conversation_warning and "BREAK" in conversation_warning:
@@ -215,51 +308,142 @@ You CANNOT talk right now. You must EXPLORE elsewhere!
 ❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
 
 Reply with ONLY one of: move north | move south | move east | move west"""
-            return prompt, "move"
+            return prompt, "move", None
+        
+        # PRIORITY 4: Must leave after saying goodbye (force 5 moves away)
+        if self.must_leave:
+            # Set cooldown so we don't re-engage immediately
+            if self.leaving_from:
+                self.goodbye_cooldown[self.leaving_from] = 8  # 8 turns before we can talk to them again
+            self.must_leave = False
+            self.leaving_from = None
+            
+            prompt = f"""You are {self.name}, exploring the world.
+{history_context}
+{text_desc}
+
+You just said goodbye to someone. Time to explore NEW areas far away!
+Pick a direction and KEEP GOING that way.
+✅ Valid moves: {', '.join(valid_moves)}
+❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
+
+Reply with ONLY one of: move north | move south | move east | move west"""
+            return prompt, "move", None
+        
+        # Decrement all goodbye cooldowns
+        for char_id in list(self.goodbye_cooldown.keys()):
+            self.goodbye_cooldown[char_id] -= 1
+            if self.goodbye_cooldown[char_id] <= 0:
+                del self.goodbye_cooldown[char_id]
+                # Also clear memory when cooldown expires so next meeting feels fresh
+                if char_id in self.conversation_memory:
+                    self.conversation_memory[char_id] = []
+                    self.discussed_topics[char_id] = set()
         
         if can_talk and nearby_chars:
             other = nearby_chars[0]
             other_name = other["name"]
+            other_id = other.get("id", other_name)
             
-            # Check if they said something to us
+            # Check if we're in goodbye cooldown with this person
+            if other_id in self.goodbye_cooldown:
+                remaining = self.goodbye_cooldown[other_id]
+                prompt = f"""You are {self.name}, exploring the world.
+{history_context}
+{text_desc}
+
+You recently said goodbye to {other_name}. Keep exploring elsewhere for now!
+✅ Valid moves: {', '.join(valid_moves)}
+❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
+
+Reply with ONLY one of: move north | move south | move east | move west"""
+                return prompt, "move", None
+            
+            # Build actual conversation history from server
+            convo_history = ""
+            if recent_convos:
+                convo_history = "\n💬 RECENT CONVERSATION:\n"
+                for c in recent_convos[-6:]:  # Last 6 messages for context
+                    speaker = c.get("speaker_name", "Someone")
+                    msg = c.get("message", "")[:200]
+                    if speaker == self.name:
+                        convo_history += f'  YOU: "{msg}"\n'
+                    else:
+                        convo_history += f'  {speaker}: "{msg}"\n'
+            
+            # Find what they JUST said to us
             last_said_to_me = None
             for c in reversed(recent_convos):
                 if c.get("listener_id") == self.char_id:
                     last_said_to_me = c.get("message")
                     break
             
-            # Add fatigue context
-            fatigue_note = conversation_warning if conversation_warning else ""
+            # Check if they said goodbye - we should acknowledge and leave too
+            if last_said_to_me:
+                goodbye_phrases = ['goodbye', 'farewell', 'adieu', 'bye', 'see you', 'until next', 'take care', 'been delightful', 'bid you', 'should go', 'must go', 'heading off']
+                said_goodbye = any(phrase in last_said_to_me.lower() for phrase in goodbye_phrases)
+                if said_goodbye:
+                    # They said goodbye - acknowledge it and leave
+                    prompt = f"""You are {self.name}.
+{other_name} is saying goodbye: "{last_said_to_me[:100]}"
+
+Say goodbye back warmly. Use "goodbye", "farewell", or "take care". One sentence only:"""
+                    return prompt, "goodbye", other_id
+            
+            # Count our local exchanges for goodbye logic
+            our_messages = self.conversation_memory.get(other_id, [])
+            exchange_count = len(our_messages)
+            
+            # After 12 exchanges, say goodbye
+            if exchange_count >= 12:
+                prompt = f"""You are {self.name}.
+You've been talking to {other_name} for a while and it's time to explore elsewhere.
+
+Say goodbye to them. Be warm but clear that you're leaving. Use a phrase like "goodbye", "farewell", "I should go", or "take care". One sentence only:"""
+                return prompt, "goodbye", other_id
+            
+            # Get topics we've covered to suggest variety
+            discussed = self.discussed_topics.get(other_id, set())
+            topic_hint = ""
+            if len(discussed) > 3:
+                unused = [t for t in ['your past', 'dreams', 'fears', 'home', 'adventures', 'food', 'music'] 
+                         if t not in ' '.join(discussed)]
+                if unused:
+                    topic_hint = f"\n(Maybe ask about: {', '.join(unused[:2])})"
             
             if last_said_to_me:
+                # Check if they asked a question
+                asked_question = '?' in last_said_to_me
+                
                 prompt = f"""You are {self.name}. 
-Personality: {self.personality}
+Personality: {self.personality[:200]}
 Traits: {traits_str}
-Energy: {energy}
-{fatigue_note}
+{convo_history}
 
-{other_name} just said to you: "{last_said_to_me}"
-{convo_context}
+{other_name} just said: "{last_said_to_me}"
 
-Respond naturally in character. Keep it to 1-2 sentences.
-{f"(Note: conversation is getting long, maybe wrap up soon!)" if fatigue_note else ""}
+{"They asked you a question - ANSWER IT FIRST with a specific response, then you can add your own thought." if asked_question else "React to what they shared, then continue the conversation."}
 
-Say your response (dialogue only, no actions):"""
+IMPORTANT:
+- Actually ANSWER if they asked something (don't just ask another question back)
+- Share something SPECIFIC about yourself or your experiences  
+- Keep it to 2-3 sentences, just dialogue, no *asterisk actions*{topic_hint}
+
+Your response:"""
             else:
                 prompt = f"""You are {self.name}.
-Personality: {self.personality}
+Personality: {self.personality[:200]}
 Traits: {traits_str}
-Energy: {energy}
-{fatigue_note}
+{convo_history}
 
-You see {other_name} right next to you! Start a conversation.
-{convo_context}
+You see {other_name} next to you. {"Continue the conversation." if convo_history else "Start a conversation."}
 
-Greet them or say something interesting. Keep it to 1-2 sentences. Stay in character.
+- Share something interesting about yourself or ask them about their experiences
+- Keep it to 2-3 sentences, just dialogue, no *asterisk actions*{topic_hint}
 
-Say your greeting (dialogue only):"""
+What you say:"""
             
-            return prompt, "talk"
+            return prompt, "talk", other_id
         
         elif nearby_chars:
             other = nearby_chars[0]
@@ -278,7 +462,7 @@ IMPORTANT: Check your action history above! Don't repeat failed moves!
 
 Reply with ONLY one of: move north | move south | move east | move west"""
             
-            return prompt, "move"
+            return prompt, "move", None
         
         else:
             time_note = "🌙 It's night time. The world is quiet." if is_night else ""
@@ -299,7 +483,7 @@ IMPORTANT: Check your action history above!
 
 Reply with ONLY one of: move north | move south | move east | move west"""
             
-            return prompt, "move"
+            return prompt, "move", None
     
     def parse_response(self, response: str, expected_type: str) -> tuple:
         """Parse Ollama response into action and parameters."""
@@ -312,6 +496,17 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
             return "talk", {"message": message[:300] or "Hello!"}
+        
+        elif expected_type == "goodbye":
+            # Parse as a talk action but flag for leaving
+            message = response
+            for prefix in ["talk ", "Talk ", "say ", "Say ", '"', "Farewell:", "Goodbye:"]:
+                if message.lower().startswith(prefix.lower()):
+                    message = message[len(prefix):]
+            message = message.strip().strip('"').strip()
+            if not message or len(message) < 3:
+                message = "It was nice talking! I should explore more. Goodbye!"
+            return "talk", {"message": message[:200], "is_goodbye": True}
         
         elif expected_type == "rest":
             # Parse interact command for resting
@@ -391,7 +586,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 print(f"{'─' * 50}")
                 
                 # Build prompt with action history
-                prompt, expected_type = self.build_prompt(state)
+                prompt, expected_type, talk_target_id = self.build_prompt(state)
                 
                 print(f"🤔 Thinking...")
                 response = ollama_generate(prompt, self.model)
@@ -400,8 +595,21 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 action, params = self.parse_response(response, expected_type)
                 
                 if action == "talk":
-                    print(f'💬 "{params["message"]}"')
-                    action_desc = f"talk: {params['message'][:50]}"
+                    message = params["message"]
+                    is_goodbye = params.get("is_goodbye", False)
+                    
+                    if is_goodbye:
+                        print(f'👋 "{message}"')
+                        # Set flag to force movement on next turn
+                        self.must_leave = True
+                        self.leaving_from = talk_target_id
+                    else:
+                        print(f'💬 "{message}"')
+                    
+                    # Remember what we said to avoid repetition
+                    if talk_target_id:
+                        self.remember_our_message(talk_target_id, message)
+                    action_desc = f"talk: {message[:50]}"
                 elif action == "interact":
                     print(f"💤 Resting at {params.get('target', 'rest spot')}")
                     action_desc = f"rest at {params.get('target', '?')}"

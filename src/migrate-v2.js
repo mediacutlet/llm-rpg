@@ -37,12 +37,18 @@ async function migrate() {
     `);
     console.log('✅ Added day/night cycle to world');
     
-    // Reset everyone's energy to full
-    await pool.query('UPDATE characters SET energy = 100, max_energy = 100');
-    console.log('✅ Reset all character energy to 100');
+    // Fix any NULL energy values (IMPORTANT: This handles the NULL arithmetic bug)
+    const nullCount = await pool.query('SELECT COUNT(*) FROM characters WHERE energy IS NULL');
+    if (nullCount.rows[0].count > 0) {
+      console.log(`⚠️ Found ${nullCount.rows[0].count} characters with NULL energy, fixing...`);
+    }
+    
+    // Reset/fix everyone's energy (handles NULL values)
+    await pool.query('UPDATE characters SET energy = COALESCE(energy, 100), max_energy = COALESCE(max_energy, 100)');
+    console.log('✅ Fixed all character energy values (NULL → 100)');
     
     // Reset conversation exchanges
-    await pool.query('UPDATE relationships SET recent_exchanges = 0, cooldown_until_tick = 0');
+    await pool.query('UPDATE relationships SET recent_exchanges = COALESCE(recent_exchanges, 0), cooldown_until_tick = COALESCE(cooldown_until_tick, 0)');
     console.log('✅ Reset all conversation exchanges');
     
     console.log('\n✨ Migration complete!');

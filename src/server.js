@@ -196,7 +196,7 @@ async function worldTick() {
     if (tick % 10 === 0) {
       await pool.query(`
         UPDATE characters 
-        SET energy = LEAST(max_energy, energy + 5)
+        SET energy = LEAST(COALESCE(max_energy, 100), COALESCE(energy, 100) + 5)
         WHERE last_action_tick < $1 - 20
       `, [tick]); // Regen for idle characters
     }
@@ -233,7 +233,6 @@ async function worldTick() {
         [tick, 'world_event', event]
       );
       broadcast('event', { tick, message: event });
-    }
     }
     
   } catch (err) {
@@ -407,8 +406,8 @@ app.post('/api/register', async (req, res) => {
     } while (blockedSet.has(`${x},${y}`));
     
     await pool.query(`
-      INSERT INTO characters (id, token, name, emoji, personality, origin_story, traits, turn_interval, x, y, is_hatched, hatched_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      INSERT INTO characters (id, token, name, emoji, personality, origin_story, traits, turn_interval, x, y, is_hatched, hatched_at, energy, max_energy)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 100, 100)
     `, [
       id, 
       token, 
@@ -766,8 +765,8 @@ app.post('/api/action/:charId', async (req, res) => {
           });
         }
         
-        // Deduct energy
-        await pool.query('UPDATE characters SET energy = energy - $1 WHERE id = $2', [energyCost, charId]);
+        // Deduct energy (use COALESCE to handle NULL)
+        await pool.query('UPDATE characters SET energy = COALESCE(energy, 100) - $1 WHERE id = $2', [energyCost, charId]);
         
         await pool.query(
           'INSERT INTO conversations (tick, speaker_id, listener_id, message) VALUES ($1, $2, $3, $4)',
@@ -904,10 +903,10 @@ app.post('/api/action/:charId', async (req, res) => {
                           o.name.toLowerCase().includes('pond');
         
         if (isRestSpot) {
-          // Restore energy
+          // Restore energy (use COALESCE to handle NULL)
           const energyRestored = o.name.toLowerCase().includes('cottage') ? 50 : 30;
           await pool.query(
-            'UPDATE characters SET energy = LEAST(max_energy, energy + $1) WHERE id = $2',
+            'UPDATE characters SET energy = LEAST(COALESCE(max_energy, 100), COALESCE(energy, 0) + $1) WHERE id = $2',
             [energyRestored, charId]
           );
           

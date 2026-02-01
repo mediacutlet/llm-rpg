@@ -392,7 +392,7 @@ Reply with ONLY: move {self.traveling_direction}"""
                 convo_history = "\n💬 RECENT CONVERSATION:\n"
                 for c in recent_convos[-6:]:  # Last 6 messages for context
                     speaker = c.get("speaker_name", "Someone")
-                    msg = c.get("message", "")[:200]
+                    msg = c.get("message", "")[:400]
                     if speaker == self.name:
                         convo_history += f'  YOU: "{msg}"\n'
                     else:
@@ -401,10 +401,10 @@ Reply with ONLY: move {self.traveling_direction}"""
             # Find what they JUST said to us (must be very recent - within last 3 ticks)
             last_said_to_me = None
             last_said_tick = 0
-            current_tick = state.get("world", {}).get("tick", 0)
+            current_tick = int(state.get("world", {}).get("tick", 0) or 0)
             for c in reversed(recent_convos):
                 if c.get("listener_id") == self.char_id:
-                    msg_tick = c.get("tick", 0)
+                    msg_tick = int(c.get("tick", 0) or 0)
                     # Only consider messages from the last 3 ticks as "just said"
                     if current_tick - msg_tick <= 3:
                         last_said_to_me = c.get("message")
@@ -421,7 +421,7 @@ Reply with ONLY: move {self.traveling_direction}"""
                 we_said_goodbye_recently = False
                 for c in reversed(recent_convos):
                     if c.get("speaker_id") == self.char_id:
-                        msg_tick = c.get("tick", 0)
+                        msg_tick = int(c.get("tick", 0) or 0)
                         if current_tick - msg_tick <= 5:
                             if any(phrase in c.get("message", "").lower() for phrase in goodbye_phrases):
                                 we_said_goodbye_recently = True
@@ -430,7 +430,7 @@ Reply with ONLY: move {self.traveling_direction}"""
                 if said_goodbye and not we_said_goodbye_recently:
                     # They said goodbye - acknowledge it and leave
                     prompt = f"""You are {self.name}.
-{other_name} is saying goodbye: "{last_said_to_me[:100]}"
+{other_name} is saying goodbye: "{last_said_to_me[:300]}"
 
 Say goodbye back warmly. Use "goodbye", "farewell", or "take care". One sentence only:"""
                     return prompt, "goodbye", other_id
@@ -472,7 +472,7 @@ Traits: {traits_str}
 IMPORTANT:
 - Actually ANSWER if they asked something (don't just ask another question back)
 - Share something SPECIFIC about yourself or your experiences  
-- Keep it to 2-3 sentences, just dialogue, no *asterisk actions*{topic_hint}
+- Keep it to 3-4 sentences, just dialogue, no *asterisk actions*{topic_hint}
 
 Your response:"""
             else:
@@ -484,7 +484,7 @@ Traits: {traits_str}
 You see {other_name} next to you. {"Continue the conversation." if convo_history else "Start a conversation."}
 
 - Share something interesting about yourself or ask them about their experiences
-- Keep it to 2-3 sentences, just dialogue, no *asterisk actions*{topic_hint}
+- Keep it to 3-4 sentences, just dialogue, no *asterisk actions*{topic_hint}
 
 What you say:"""
             
@@ -551,7 +551,7 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             message = message.strip().strip('"').strip()
             if not message or len(message) < 3:
                 message = "It was nice talking! I should explore more. Goodbye!"
-            return "talk", {"message": message[:200], "is_goodbye": True}
+            return "talk", {"message": message[:500], "is_goodbye": True}
         
         elif expected_type == "rest":
             # Parse interact command for resting

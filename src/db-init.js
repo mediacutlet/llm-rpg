@@ -56,7 +56,6 @@ CREATE TABLE IF NOT EXISTS characters (
   
   -- Timestamps
   created_at TIMESTAMP DEFAULT NOW(),
-  hatched_at TIMESTAMP,
   last_seen_at TIMESTAMP DEFAULT NOW()
 );
 

@@ -232,42 +232,73 @@ class LLMRPGAgent:
     
     def generate_summary(self, other_name: str, other_id: str, recent_convos: list) -> dict:
         """Ask LLM to summarize the conversation."""
-        # Build conversation text
-        convo_text = ""
-        for c in recent_convos[-10:]:  # Last 10 messages
-            speaker = c.get("speaker_name", "Someone")
-            msg = c.get("message", "")[:200]
-            convo_text += f'{speaker}: "{msg}"\n'
+        # Filter to only messages between us and the other character
+        relevant_convos = []
+        for c in recent_convos:
+            speaker = c.get("speaker_name", "")
+            listener_id = c.get("listener_id", "")
+            speaker_id = c.get("speaker_id", "")
+            
+            # Include if: we said to them, or they said to us
+            is_relevant = (speaker == self.name and listener_id == other_id) or \
+                         (speaker == other_name and listener_id == self.char_id) or \
+                         (speaker_id == other_id and listener_id == self.char_id) or \
+                         (speaker_id == self.char_id and listener_id == other_id)
+            
+            if is_relevant:
+                relevant_convos.append(c)
         
-        if not convo_text:
+        # Need at least 4 back-and-forth messages for a meaningful summary
+        if len(relevant_convos) < 4:
             return None
         
-        prompt = f"""Summarize this conversation between {self.name} and {other_name}.
+        # Build conversation text from last 12 relevant messages
+        convo_text = ""
+        for c in relevant_convos[-12:]:
+            speaker = c.get("speaker_name", "Someone")
+            msg = c.get("message", "")[:300]  # More context per message
+            convo_text += f'{speaker}: "{msg}"\n'
+        
+        if not convo_text.strip():
+            return None
+        
+        prompt = f"""You are summarizing a conversation between {self.name} and {other_name}.
 
-CONVERSATION:
+THE CONVERSATION:
 {convo_text}
 
-Respond with EXACTLY this format (no extra text):
-TITLE: [A short 3-5 word title for this conversation]
-SUMMARY: [2-3 sentences summarizing what was discussed]
-TOPICS: [comma-separated list of 3-5 key topics]"""
+Create a memory of this conversation. Write:
+1. TITLE: A descriptive 4-6 word title capturing the main theme (not just "Conversation")
+2. SUMMARY: 2-3 sentences describing what they discussed, any revelations, shared interests, or notable moments
+3. TOPICS: 3-5 key topics or themes from the discussion
+
+Format your response EXACTLY like this:
+TITLE: [your title here]
+SUMMARY: [your summary here]
+TOPICS: [topic1, topic2, topic3]"""
         
         try:
             response = ollama_generate(prompt, self.model)
             
             # Parse response
-            title = "Conversation"
+            title = ""
             summary = ""
             topics = []
             
             for line in response.split('\n'):
                 line = line.strip()
                 if line.upper().startswith('TITLE:'):
-                    title = line[6:].strip()
+                    title = line[6:].strip().strip('"').strip("'")
                 elif line.upper().startswith('SUMMARY:'):
                     summary = line[8:].strip()
                 elif line.upper().startswith('TOPICS:'):
                     topics = [t.strip() for t in line[7:].split(',') if t.strip()]
+            
+            # Validate we got meaningful content
+            if not title or title.lower() in ['conversation', 'a conversation', 'chat']:
+                title = f"Discussion with {other_name}"
+            if not summary or len(summary) < 20:
+                return None  # Not a real summary
             
             return {
                 "title": title[:100],
@@ -380,22 +411,31 @@ TOPICS: [comma-separated list of 3-5 key topics]"""
             
             # Skip if already in cooldown (already said goodbye)
             if other_id not in self.goodbye_cooldown:
-                # Check how many exchanges we've had
-                our_messages = self.conversation_memory.get(other_id, [])
-                exchange_count = len(our_messages)
+                # Get exchange count from SERVER (survives agent restarts and is more reliable)
+                fatigue = other.get("conversationFatigue", {})
+                server_exchanges = int(fatigue.get("exchanges", 0) or 0)
                 
-                # Reasons to leave (more relaxed):
-                # - Critically low energy (<25) or hunger (<20) - urgent, leave after 2 exchanges
+                # Also check local memory for THIS session
+                local_messages = self.conversation_memory.get(other_id, [])
+                local_count = len(local_messages)
+                
+                # Use whichever is SMALLER (prevents false positives from stale data)
+                exchange_count = min(server_exchanges, local_count) if local_count > 0 else server_exchanges
+                
+                # Reasons to leave:
+                # - Critically low energy (<30) or hunger (<25) - urgent, leave after 2 exchanges  
+                # - Moderately low energy (<40) or hunger (<35) - leave after 5 exchanges
                 # - Had 10+ exchanges - natural conversation endpoint
-                urgent_need = (energy < 25 or hunger < 20) and exchange_count >= 2
+                urgent_need = (energy < 30 or hunger < 25) and exchange_count >= 2
+                moderate_need = (energy < 40 or hunger < 35) and exchange_count >= 5
                 talked_enough = exchange_count >= 10
                 
-                should_leave = urgent_need or talked_enough
+                should_leave = urgent_need or moderate_need or talked_enough
                 
                 if should_leave:
-                    if energy < 25:
-                        reason = "need to rest soon"
-                    elif hunger < 20:
+                    if energy < 40:
+                        reason = "need to find somewhere to rest"
+                    elif hunger < 35:
                         reason = "need to get some food"
                     else:
                         reason = "should explore more of the world"
@@ -822,21 +862,8 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
             
-            # Strip markdown emphasis but keep the content
-            message = re.sub(r'\*\*([^*]+)\*\*', r'\1', message)  # **bold** -> bold
-            message = re.sub(r'\*([^*]+)\*', r'\1', message)  # *italic* -> italic
-            message = re.sub(r'__([^_]+)__', r'\1', message)  # __bold__ -> bold
-            message = re.sub(r'_([^_]+)_', r'\1', message)  # _italic_ -> italic
-            message = re.sub(r'\*+', '', message)  # Remove any remaining stray asterisks
-            
-            # Strip parenthetical stage directions like (pauses) or (leans forward)
-            message = re.sub(r'\([^)]*\)', '', message)
-            
-            # Strip action words at start of sentences (verbs followed by descriptions)
-            action_starters = r'^(zooms|leans|adjusts|smiles|grins|nods|waves|sighs|laughs|giggles|chuckles|pauses|looks|glances|turns|steps|moves|walks|runs|jumps|reaches|points|gestures|shrugs|tilts|raises|lowers|crosses|uncrosses|shifts|settles|straightens|relaxes)\b[^.!?]*[.!?]?\s*'
-            message = re.sub(action_starters, '', message, flags=re.IGNORECASE)
-            
-            message = re.sub(r'\s+', ' ', message).strip()  # Clean up extra spaces
+            # Clean up extra whitespace
+            message = re.sub(r'\s+', ' ', message).strip()
             
             # Truncate if way too long (model went on a monologue)
             sentences = message.split('. ')
@@ -852,13 +879,6 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if message.lower().startswith(prefix.lower()):
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
-            
-            # Strip markdown emphasis but keep the content
-            message = re.sub(r'\*\*([^*]+)\*\*', r'\1', message)
-            message = re.sub(r'\*([^*]+)\*', r'\1', message)
-            message = re.sub(r'__([^_]+)__', r'\1', message)
-            message = re.sub(r'_([^_]+)_', r'\1', message)
-            message = re.sub(r'\*+', '', message)
             message = re.sub(r'\s+', ' ', message).strip()
             
             if not message or len(message) < 3:
@@ -978,27 +998,33 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         self.must_leave = True
                         self.leaving_from = talk_target_id
                         
-                        # Generate and save conversation summary
+                        # Generate and save conversation summary ONLY if we had a real conversation (5+ exchanges)
                         if talk_target_id:
-                            other_name = None
-                            for n in state.get("nearbyCharacters", []):
-                                if n.get("id") == talk_target_id:
-                                    other_name = n.get("name", "Someone")
-                                    break
+                            our_messages = self.conversation_memory.get(talk_target_id, [])
+                            exchange_count = len(our_messages)
                             
-                            if other_name:
-                                print(f"📝 Summarizing conversation...")
-                                summary_data = self.generate_summary(
-                                    other_name, 
-                                    talk_target_id, 
-                                    state.get("recentConversations", [])
-                                )
-                                if summary_data:
-                                    if self.save_summary(talk_target_id, 
-                                                        summary_data["title"],
-                                                        summary_data["summary"],
-                                                        summary_data["topics"]):
-                                        print(f"   ✅ Saved: \"{summary_data['title']}\"")
+                            if exchange_count >= 5:
+                                other_name = None
+                                for n in state.get("nearbyCharacters", []):
+                                    if n.get("id") == talk_target_id:
+                                        other_name = n.get("name", "Someone")
+                                        break
+                                
+                                if other_name:
+                                    print(f"📝 Summarizing conversation ({exchange_count} exchanges)...")
+                                    summary_data = self.generate_summary(
+                                        other_name, 
+                                        talk_target_id, 
+                                        state.get("recentConversations", [])
+                                    )
+                                    if summary_data and summary_data.get("summary"):
+                                        if self.save_summary(talk_target_id, 
+                                                            summary_data["title"],
+                                                            summary_data["summary"],
+                                                            summary_data["topics"]):
+                                            print(f"   ✅ Saved: \"{summary_data['title']}\"")
+                            else:
+                                print(f"   (Conversation too short for summary: {exchange_count} exchanges)")
                     else:
                         print(f'💬 "{message}"')
                     
@@ -1009,6 +1035,9 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         current_tick = int(state.get("world", {}).get("tick", 0) or 0)
                         self.last_talked_tick[talk_target_id] = current_tick
                     action_desc = f"talk: {message[:50]}"
+                    
+                    # Add delay after talking to give conversation a natural pace
+                    time.sleep(2)  # Extra pause after dialogue
                 elif action == "interact":
                     target = params.get('target', 'something')
                     if 'market' in target.lower():

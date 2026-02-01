@@ -1267,6 +1267,8 @@ app.post('/api/summary/:charId', async (req, res) => {
     }
     
     // Save to BOTH directions so both characters see the shared history
+    console.log(`📝 Saving summary bidirectionally: ${charId} <-> ${otherId}, ${summaries.length} total summaries`);
+    
     await pool.query(`
       INSERT INTO relationships (char1_id, char2_id, conversation_summaries, first_met_tick, last_interaction_tick)
       VALUES ($1, $2, $3, $4, $4)
@@ -1280,6 +1282,8 @@ app.post('/api/summary/:charId', async (req, res) => {
       ON CONFLICT (char1_id, char2_id) 
       DO UPDATE SET conversation_summaries = $3, last_interaction_tick = $4
     `, [otherId, charId, JSON.stringify(summaries), tick]);
+    
+    console.log(`✅ Saved to both ${charId}->${otherId} and ${otherId}->${charId}`);
     
     res.json({ success: true, summaryCount: summaries.length });
   } catch (err) {

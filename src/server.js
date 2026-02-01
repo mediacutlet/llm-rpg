@@ -334,7 +334,8 @@ app.get('/api/world', async (req, res) => {
     const world = await pool.query('SELECT * FROM world WHERE id = 1');
     const characters = await pool.query(`
       SELECT id, name, emoji, x, y, hp, max_hp, xp, level, is_active, 
-             turn_interval, last_action_tick, created_at
+             turn_interval, last_action_tick, created_at,
+             COALESCE(energy, 100) as energy, COALESCE(max_energy, 100) as max_energy
       FROM characters WHERE is_active = true
       ORDER BY created_at
     `);
@@ -836,7 +837,8 @@ app.post('/api/action/:charId', async (req, res) => {
         broadcast('talk', { 
           speaker: { id: charId, name: me.name, emoji: me.emoji },
           listener: { id: listener.id, name: listener.name },
-          message: message.slice(0, 1000)
+          message: message.slice(0, 1000),
+          speakerEnergy: currentEnergy - energyCost
         });
         
         // Build response with fatigue info
@@ -917,7 +919,7 @@ app.post('/api/action/:charId', async (req, res) => {
             [tick, charId, 'rest', `${me.name} rests at the ${o.name} and recovers energy`]
           );
           
-          broadcast('rest', { id: charId, name: me.name, object: o.name, energyRestored });
+          broadcast('rest', { id: charId, name: me.name, object: o.name, energyRestored, newEnergy: newEnergy.rows[0].energy });
           
           result = { 
             success: true, 

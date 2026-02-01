@@ -146,12 +146,8 @@
     .convo-message { font-style: italic; }
     .convo-message .emote { 
       font-style: italic; 
+      font-weight: bold;
       color: #8b7ec9; 
-      font-size: 0.85em;
-      display: block;
-      margin: 4px 0;
-      padding-left: 10px;
-      border-left: 2px solid #8b7ec944;
     }
     
     .activity-list { max-height: 200px; overflow-y: auto; font-size: 0.85rem; }
@@ -406,6 +402,12 @@
           message: data.message,
           tick: parseInt(document.getElementById('tickCount').textContent)
         });
+        // Update speaker's energy
+        const speaker = worldData.characters.find(c => c.id === data.speaker.id);
+        if (speaker && data.speakerEnergy !== undefined) {
+          speaker.energy = data.speakerEnergy;
+          renderLeaderboard();
+        }
         renderConversations();
       });
       
@@ -420,6 +422,15 @@
         const data = JSON.parse(e.data);
         const char = worldData.characters.find(c => c.id === data.id);
         if (char) { char.level = data.newLevel; char.max_hp = data.maxHp; renderLeaderboard(); }
+      });
+      
+      eventSource.addEventListener('rest', (e) => {
+        const data = JSON.parse(e.data);
+        const char = worldData.characters.find(c => c.id === data.id);
+        if (char && data.newEnergy !== undefined) {
+          char.energy = data.newEnergy;
+          renderLeaderboard();
+        }
       });
     }
     

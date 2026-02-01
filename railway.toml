@@ -2,11 +2,8 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "npm run db:init && npm start"
+startCommand = "npm start"
 healthcheckPath = "/api/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 60
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
-
-[[services]]
-name = "web"

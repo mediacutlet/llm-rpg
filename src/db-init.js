@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS relationships (
   interactions INTEGER DEFAULT 0,
   first_met_tick BIGINT,
   last_interaction_tick BIGINT,
+  conversation_summaries JSONB DEFAULT '[]',
   PRIMARY KEY (char1_id, char2_id)
 );
 

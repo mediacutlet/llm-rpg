@@ -24,7 +24,8 @@ async function migrate() {
     await pool.query(`
       ALTER TABLE relationships
       ADD COLUMN IF NOT EXISTS recent_exchanges INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS cooldown_until_tick BIGINT DEFAULT 0
+      ADD COLUMN IF NOT EXISTS cooldown_until_tick BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS conversation_summaries JSONB DEFAULT '[]'
     `);
     console.log('✅ Added conversation tracking to relationships');
     

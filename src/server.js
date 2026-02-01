@@ -117,6 +117,12 @@ async function addSignificantMoment(charId, moment, category = 'general') {
   const me = char.rows[0];
   let moments = me.significant_moments || [];
   
+  // Prevent duplicate "first meeting" moments
+  if (moment.includes('for the first time')) {
+    const alreadyMet = moments.some(m => m.moment === moment);
+    if (alreadyMet) return; // Skip - already recorded this meeting
+  }
+  
   // Add new moment
   moments.push({
     tick,
@@ -563,7 +569,7 @@ app.get('/api/look/:charId', async (req, res) => {
     
     // Get conversation fatigue info for nearby characters
     const fatigueInfo = await pool.query(`
-      SELECT char2_id, recent_exchanges, cooldown_until_tick 
+      SELECT char2_id, recent_exchanges, cooldown_until_tick, conversation_summaries 
       FROM relationships 
       WHERE char1_id = $1
     `, [charId]);
@@ -571,7 +577,8 @@ app.get('/api/look/:charId', async (req, res) => {
     fatigueInfo.rows.forEach(r => {
       fatigueMap[r.char2_id] = { 
         exchanges: r.recent_exchanges || 0, 
-        cooldownUntil: r.cooldown_until_tick || 0 
+        cooldownUntil: r.cooldown_until_tick || 0,
+        summaries: r.conversation_summaries || []
       };
     });
     
@@ -720,7 +727,7 @@ app.get('/api/look/:charId', async (req, res) => {
       world: { ...world.rows[0], isNight },
       nearbyCharacters: nearbyChars.map(c => ({
         ...c,
-        conversationFatigue: fatigueMap[c.id] || { exchanges: 0, cooldownUntil: 0 }
+        conversationFatigue: fatigueMap[c.id] || { exchanges: 0, cooldownUntil: 0, summaries: [] }
       })),
       nearbyObjects: nearbyObjs,
       restSpotsNearby: restSpots,
@@ -1129,6 +1136,65 @@ app.patch('/api/character/:charId', async (req, res) => {
     );
     
     res.json({ success: true, message: 'Character updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Save conversation summary (chapter marker)
+app.post('/api/summary/:charId', async (req, res) => {
+  try {
+    const { charId } = req.params;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    const { otherId, title, summary, topics } = req.body;
+    
+    // Verify token
+    const char = await pool.query(
+      'SELECT * FROM characters WHERE id = $1 AND token = $2',
+      [charId, token]
+    );
+    
+    if (char.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid character or token' });
+    }
+    
+    const world = await pool.query('SELECT tick FROM world WHERE id = 1');
+    const tick = world.rows[0].tick;
+    
+    // Get existing summaries
+    const rel = await pool.query(
+      'SELECT conversation_summaries FROM relationships WHERE char1_id = $1 AND char2_id = $2',
+      [charId, otherId]
+    );
+    
+    let summaries = [];
+    if (rel.rows.length > 0 && rel.rows[0].conversation_summaries) {
+      summaries = rel.rows[0].conversation_summaries;
+    }
+    
+    // Add new summary
+    summaries.push({
+      tick,
+      title: (title || 'Conversation').slice(0, 100),
+      summary: (summary || '').slice(0, 500),
+      topics: (topics || []).slice(0, 10),
+      timestamp: new Date().toISOString()
+    });
+    
+    // Keep only last 20 summaries
+    if (summaries.length > 20) {
+      summaries = summaries.slice(-20);
+    }
+    
+    // Upsert relationship with new summaries
+    await pool.query(`
+      INSERT INTO relationships (char1_id, char2_id, conversation_summaries, first_met_tick, last_interaction_tick)
+      VALUES ($1, $2, $3, $4, $4)
+      ON CONFLICT (char1_id, char2_id) 
+      DO UPDATE SET conversation_summaries = $3, last_interaction_tick = $4
+    `, [charId, otherId, JSON.stringify(summaries), tick]);
+    
+    res.json({ success: true, summaryCount: summaries.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

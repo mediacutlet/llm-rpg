@@ -21,6 +21,7 @@ import time
 import subprocess
 import sys
 import random
+import re
 
 DEFAULT_MODEL = "llama3"  # Change to your preferred model
 POLL_INTERVAL = 2  # Seconds between checking if we can act
@@ -81,6 +82,9 @@ class LLMRPGAgent:
         
         # Post-goodbye cooldown - don't talk to same person for X turns
         self.goodbye_cooldown = {}  # {char_id: turns_remaining}
+        
+        # Track when we last talked to each character (for greetings)
+        self.last_talked_tick = {}  # {char_id: tick}
         
         # Traveling state - keep moving in same direction after goodbye
         self.traveling_direction = None
@@ -204,6 +208,73 @@ class LLMRPGAgent:
         )
         return r.json()
     
+    def save_summary(self, other_id: str, title: str, summary: str, topics: list) -> bool:
+        """Save a conversation summary to the server."""
+        try:
+            r = requests.post(
+                f"{self.server}/api/summary/{self.char_id}",
+                headers=self.headers,
+                json={
+                    "otherId": other_id,
+                    "title": title,
+                    "summary": summary,
+                    "topics": topics
+                },
+                timeout=10
+            )
+            return r.status_code == 200
+        except Exception as e:
+            print(f"  ⚠️ Failed to save summary: {e}")
+            return False
+    
+    def generate_summary(self, other_name: str, other_id: str, recent_convos: list) -> dict:
+        """Ask LLM to summarize the conversation."""
+        # Build conversation text
+        convo_text = ""
+        for c in recent_convos[-10:]:  # Last 10 messages
+            speaker = c.get("speaker_name", "Someone")
+            msg = c.get("message", "")[:200]
+            convo_text += f'{speaker}: "{msg}"\n'
+        
+        if not convo_text:
+            return None
+        
+        prompt = f"""Summarize this conversation between {self.name} and {other_name}.
+
+CONVERSATION:
+{convo_text}
+
+Respond with EXACTLY this format (no extra text):
+TITLE: [A short 3-5 word title for this conversation]
+SUMMARY: [2-3 sentences summarizing what was discussed]
+TOPICS: [comma-separated list of 3-5 key topics]"""
+        
+        try:
+            response = ollama_generate(prompt, self.model)
+            
+            # Parse response
+            title = "Conversation"
+            summary = ""
+            topics = []
+            
+            for line in response.split('\n'):
+                line = line.strip()
+                if line.upper().startswith('TITLE:'):
+                    title = line[6:].strip()
+                elif line.upper().startswith('SUMMARY:'):
+                    summary = line[8:].strip()
+                elif line.upper().startswith('TOPICS:'):
+                    topics = [t.strip() for t in line[7:].split(',') if t.strip()]
+            
+            return {
+                "title": title[:100],
+                "summary": summary[:500],
+                "topics": topics[:10]
+            }
+        except Exception as e:
+            print(f"  ⚠️ Failed to generate summary: {e}")
+            return None
+    
     def build_prompt(self, state: dict) -> tuple:
         """Build a prompt for Ollama based on world state and action history."""
         
@@ -276,8 +347,34 @@ class LLMRPGAgent:
                 msg = c.get("message", "")
                 convo_context += f'  {speaker}: "{msg}"\n'
         
-        # PRIORITY 1: Need rest and near rest spot (within interaction range)
-        if needs_rest and rest_spots:
+        # Get current tick for timing checks
+        current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+        
+        # PRIORITY 0: If we're next to someone and need to leave, say goodbye first!
+        if can_talk and nearby_chars and not self.must_leave:
+            other = nearby_chars[0]
+            other_name = other["name"]
+            other_id = other.get("id", other_name)
+            
+            # Skip if already in cooldown (already said goodbye)
+            if other_id not in self.goodbye_cooldown:
+                # Check how many exchanges we've had (local tracking is more reliable)
+                our_messages = self.conversation_memory.get(other_id, [])
+                exchange_count = len(our_messages)
+                
+                # Reasons to leave: low energy, or talked too much
+                should_leave = needs_rest or exchange_count >= 8
+                
+                if should_leave and exchange_count >= 1:  # Only if we've actually talked
+                    reason = "need to find somewhere to rest" if needs_rest else "been chatting for a while"
+                    prompt = f"""You are {self.name}.
+You've {reason} and need to say goodbye to {other_name} before leaving.
+
+Say goodbye warmly in one sentence. Use "goodbye", "farewell", "I should go", or "take care":"""
+                    return prompt, "goodbye", other_id
+        
+        # PRIORITY 1: Need rest and near rest spot (within interaction range) - only if alone
+        if needs_rest and rest_spots and not (can_talk and nearby_chars):
             closest_rest = rest_spots[0]
             closest_name = closest_rest["name"]
             closest_dist = closest_rest.get("distance", 10)
@@ -307,8 +404,8 @@ Move {dir_hint.upper()} toward it to rest!
 Reply with ONLY: move {dir_hint}"""
                 return prompt, "move", None
         
-        # PRIORITY 2: Need rest but no spot nearby - find one
-        if needs_rest:
+        # PRIORITY 2: Need rest but no spot nearby (and not talking to someone) - find one
+        if needs_rest and not (can_talk and nearby_chars):
             prompt = f"""You are {self.name}, exploring the world.
 {history_context}
 {text_desc}
@@ -377,6 +474,9 @@ Reply with ONLY: move {direction}"""
                 if char_id in self.conversation_memory:
                     self.conversation_memory[char_id] = []
                     self.discussed_topics[char_id] = set()
+                # Clear last_talked so we greet them again
+                if char_id in self.last_talked_tick:
+                    del self.last_talked_tick[char_id]
         
         if can_talk and nearby_chars:
             other = nearby_chars[0]
@@ -405,20 +505,26 @@ Reply with ONLY: move {self.traveling_direction}"""
             
             # Build actual conversation history from server
             convo_history = ""
+            last_convo_tick = 0
             if recent_convos:
                 convo_history = "\n💬 RECENT CONVERSATION:\n"
                 for c in recent_convos[-6:]:  # Last 6 messages for context
                     speaker = c.get("speaker_name", "Someone")
                     msg = c.get("message", "")
+                    msg_tick = int(c.get("tick", 0) or 0)
+                    last_convo_tick = max(last_convo_tick, msg_tick)
                     if speaker == self.name:
                         convo_history += f'  YOU: "{msg}"\n'
                     else:
                         convo_history += f'  {speaker}: "{msg}"\n'
             
+            # Get current tick and check how long since last conversation
+            current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+            ticks_since_last_convo = current_tick - last_convo_tick if last_convo_tick > 0 else 999
+            
             # Find what they JUST said to us (must be very recent - within last 3 ticks)
             last_said_to_me = None
             last_said_tick = 0
-            current_tick = int(state.get("world", {}).get("tick", 0) or 0)
             for c in reversed(recent_convos):
                 if c.get("listener_id") == self.char_id:
                     msg_tick = int(c.get("tick", 0) or 0)
@@ -429,7 +535,6 @@ Reply with ONLY: move {self.traveling_direction}"""
                     break
             
             # Check if they said goodbye RECENTLY - we should acknowledge and leave too
-            # But NOT if we already said goodbye (check our recent messages)
             if last_said_to_me:
                 goodbye_phrases = ['goodbye', 'farewell', 'adieu', 'bye', 'see you', 'until next', 'take care', 'been delightful', 'bid you', 'should go', 'must go', 'heading off']
                 said_goodbye = any(phrase in last_said_to_me.lower() for phrase in goodbye_phrases)
@@ -452,17 +557,59 @@ Reply with ONLY: move {self.traveling_direction}"""
 Say goodbye back warmly. One short sentence - use "goodbye", "farewell", or "take care":"""
                     return prompt, "goodbye", other_id
             
-            # Count our local exchanges for goodbye logic
-            our_messages = self.conversation_memory.get(other_id, [])
-            exchange_count = len(our_messages)
+            # Count our local exchanges for goodbye/greeting logic
+            our_local_messages = self.conversation_memory.get(other_id, [])
+            local_exchange_count = len(our_local_messages)
+            last_talked = self.last_talked_tick.get(other_id, 0)
+            ticks_since_we_talked = current_tick - last_talked if last_talked > 0 else 999
             
-            # After 12 exchanges, say goodbye
-            if exchange_count >= 12:
+            # Check SERVER data to see if we've ever met before (survives agent restarts)
+            fatigue = other.get("conversationFatigue", {})
+            server_exchanges = int(fatigue.get("exchanges", 0) or 0)
+            past_summaries = fatigue.get("summaries", [])
+            have_met_before = server_exchanges > 0 or len(recent_convos) > 0 or len(past_summaries) > 0
+            
+            # Build memory context from past summaries
+            memory_context = ""
+            if past_summaries:
+                memory_context = "\n📚 YOUR SHARED HISTORY WITH " + other_name.upper() + ":\n"
+                for s in past_summaries[-3:]:  # Last 3 summaries
+                    memory_context += f'  • "{s.get("title", "Past conversation")}": {s.get("summary", "")}\n'
+            
+            # After 8 local exchanges, say goodbye
+            if local_exchange_count >= 8:
                 prompt = f"""You are {self.name}.
-You've been talking to {other_name} for a while and it's time to explore elsewhere.
+You've had a nice conversation with {other_name}, but it's time to move on and explore.
 
-Say goodbye to them. Be warm but clear that you're leaving. Use a phrase like "goodbye", "farewell", "I should go", or "take care". One sentence only:"""
+Say goodbye warmly. Use phrases like "goodbye", "farewell", "I should go explore", or "take care". Keep it to one sentence:"""
                 return prompt, "goodbye", other_id
+            
+            # GREETING LOGIC: Greet if no local memory OR been 30+ ticks since we talked
+            should_greet = local_exchange_count == 0 or ticks_since_we_talked > 30
+            
+            if should_greet:
+                if have_met_before:
+                    # We've met before - include memory context
+                    memory_hint = ""
+                    if past_summaries:
+                        last_topic = past_summaries[-1].get("title", "")
+                        memory_hint = f"\nYou remember last time you talked about: {last_topic}"
+                    
+                    prompt = f"""You are {self.name}.
+Personality: {self.personality[:300]}
+{memory_context}
+You see {other_name}, whom you've talked to before!{memory_hint}
+
+Greet them warmly in 1-2 sentences. You might reference something from your past conversations or just say a friendly hello:"""
+                else:
+                    # First time meeting - introduce yourself
+                    prompt = f"""You are {self.name}.
+Personality: {self.personality[:300]}
+
+You see {other_name} - you've never met them before! Introduce yourself.
+
+Greet them warmly in 1-2 short sentences. Say your name and maybe ask how they're doing:"""
+                return prompt, "talk", other_id
             
             # Get topics we've covered to suggest variety
             discussed = self.discussed_topics.get(other_id, set())
@@ -477,27 +624,42 @@ Say goodbye to them. Be warm but clear that you're leaving. Use a phrase like "g
                 # Check if they asked a question
                 asked_question = '?' in last_said_to_me
                 
+                # Show what we already said to avoid repetition
+                our_last = ""
+                for c in reversed(recent_convos):
+                    if c.get("speaker_name") == self.name:
+                        our_last = c.get("message", "")[:100]
+                        break
+                
+                repetition_warning = ""
+                if our_last:
+                    repetition_warning = f'\n⚠️ You already said: "{our_last}..." - DO NOT repeat this!'
+                
                 prompt = f"""You are {self.name}. 
-Personality: {self.personality[:400]}
-Traits: {traits_str}
+Personality: {self.personality[:300]}
+{memory_context if memory_context else ""}
 {convo_history}
 
-{other_name} just said: "{last_said_to_me}"
+{other_name} just said: "{last_said_to_me[:300]}"
+{repetition_warning}
 
-{"IMPORTANT: They asked you a question! You MUST answer it before saying anything else." if asked_question else ""}
+RULES:
+1. {"ANSWER THEIR QUESTION FIRST!" if asked_question else "React to what they said."}
+2. Keep it to 2-3 short sentences MAX
+3. Just dialogue - NO asterisks, NO actions
 
-Respond naturally in 2-4 sentences. Share your thoughts, react to what they said, maybe ask a follow-up. Just speak naturally as your character - no *actions* or stage directions.{topic_hint}
-
-Your reply:"""
+What you say:"""
             else:
                 prompt = f"""You are {self.name}.
-Personality: {self.personality[:400]}
-Traits: {traits_str}
+Personality: {self.personality[:300]}
+{memory_context if memory_context else ""}
 {convo_history}
 
-You see {other_name} next to you. {"Continue the conversation." if convo_history else "Greet them and start a conversation."}
+You see {other_name}. {"Continue your conversation." if convo_history else "Say hello!"}
 
-Speak naturally in 2-4 sentences. Share something about yourself, make an observation, or ask them something. Just speak as your character - no *actions* or stage directions.{topic_hint}
+RULES:
+1. Keep it to 2-3 short sentences MAX
+2. Just dialogue - NO asterisks, NO actions
 
 What you say:"""
             
@@ -572,10 +734,24 @@ Reply with ONLY one of: move north | move south | move east | move west"""
         
         if expected_type == "talk":
             message = response
-            for prefix in ["talk ", "Talk ", "say ", "Say ", '"', "Response:", "Greeting:"]:
+            for prefix in ["talk ", "Talk ", "say ", "Say ", '"', "Response:", "Greeting:", "What you say:", "Dialogue:"]:
                 if message.lower().startswith(prefix.lower()):
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
+            
+            # Strip markdown emphasis but keep the content
+            message = re.sub(r'\*\*([^*]+)\*\*', r'\1', message)  # **bold** -> bold
+            message = re.sub(r'\*([^*]+)\*', r'\1', message)  # *italic* -> italic
+            message = re.sub(r'__([^_]+)__', r'\1', message)  # __bold__ -> bold
+            message = re.sub(r'_([^_]+)_', r'\1', message)  # _italic_ -> italic
+            message = re.sub(r'\*+', '', message)  # Remove any remaining stray asterisks
+            message = re.sub(r'\s+', ' ', message).strip()  # Clean up extra spaces
+            
+            # Truncate if way too long (model went on a monologue)
+            sentences = message.split('. ')
+            if len(sentences) > 4:
+                message = '. '.join(sentences[:4]) + '.'
+            
             return "talk", {"message": message or "Hello!"}
         
         elif expected_type == "goodbye":
@@ -585,6 +761,15 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if message.lower().startswith(prefix.lower()):
                     message = message[len(prefix):]
             message = message.strip().strip('"').strip()
+            
+            # Strip markdown emphasis but keep the content
+            message = re.sub(r'\*\*([^*]+)\*\*', r'\1', message)
+            message = re.sub(r'\*([^*]+)\*', r'\1', message)
+            message = re.sub(r'__([^_]+)__', r'\1', message)
+            message = re.sub(r'_([^_]+)_', r'\1', message)
+            message = re.sub(r'\*+', '', message)
+            message = re.sub(r'\s+', ' ', message).strip()
+            
             if not message or len(message) < 3:
                 message = "It was nice talking! I should explore more. Goodbye!"
             return "talk", {"message": message, "is_goodbye": True}
@@ -676,7 +861,10 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         nid = n.get("id", n["name"])
                         in_cooldown = nid in self.goodbye_cooldown
                         cd_remaining = self.goodbye_cooldown.get(nid, 0)
-                        print(f"   👁️ See {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining})")
+                        fatigue = n.get("conversationFatigue", {})
+                        summaries = fatigue.get("summaries", [])
+                        sum_count = len(summaries) if summaries else 0
+                        print(f"   👁️ See {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining}) memories={sum_count}")
                 
                 print(f"🤔 Thinking... (mode: {expected_type})")
                 response = ollama_generate(prompt, self.model)
@@ -693,12 +881,37 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         # Set flag to force movement on next turn
                         self.must_leave = True
                         self.leaving_from = talk_target_id
+                        
+                        # Generate and save conversation summary
+                        if talk_target_id:
+                            other_name = None
+                            for n in state.get("nearbyCharacters", []):
+                                if n.get("id") == talk_target_id:
+                                    other_name = n.get("name", "Someone")
+                                    break
+                            
+                            if other_name:
+                                print(f"📝 Summarizing conversation...")
+                                summary_data = self.generate_summary(
+                                    other_name, 
+                                    talk_target_id, 
+                                    state.get("recentConversations", [])
+                                )
+                                if summary_data:
+                                    if self.save_summary(talk_target_id, 
+                                                        summary_data["title"],
+                                                        summary_data["summary"],
+                                                        summary_data["topics"]):
+                                        print(f"   ✅ Saved: \"{summary_data['title']}\"")
                     else:
                         print(f'💬 "{message}"')
                     
                     # Remember what we said to avoid repetition
                     if talk_target_id:
                         self.remember_our_message(talk_target_id, message)
+                        # Track when we talked for greeting logic
+                        current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+                        self.last_talked_tick[talk_target_id] = current_tick
                     action_desc = f"talk: {message[:50]}"
                 elif action == "interact":
                     print(f"💤 Resting at {params.get('target', 'rest spot')}")

@@ -20,6 +20,7 @@ import json
 import time
 import subprocess
 import sys
+import random
 
 DEFAULT_MODEL = "llama3"  # Change to your preferred model
 POLL_INTERVAL = 2  # Seconds between checking if we can act
@@ -80,6 +81,10 @@ class LLMRPGAgent:
         
         # Post-goodbye cooldown - don't talk to same person for X turns
         self.goodbye_cooldown = {}  # {char_id: turns_remaining}
+        
+        # Traveling state - keep moving in same direction after goodbye
+        self.traveling_direction = None
+        self.traveling_turns = 0
     
     def get_character_info(self) -> bool:
         """Fetch character info from server using token."""
@@ -217,6 +222,9 @@ class LLMRPGAgent:
         char_data = state.get("character", {})
         energy = char_data.get("energy", 100)
         
+        # Agent-side energy check (more conservative than server's < 30)
+        needs_rest = energy < 50 or state.get("needsRest", False)
+        
         # Format traits
         traits_str = ", ".join(self.traits) if self.traits else ""
         
@@ -310,24 +318,50 @@ You CANNOT talk right now. You must EXPLORE elsewhere!
 Reply with ONLY one of: move north | move south | move east | move west"""
             return prompt, "move", None
         
-        # PRIORITY 4: Must leave after saying goodbye (force 5 moves away)
+        # PRIORITY 4: Must leave after saying goodbye
         if self.must_leave:
             # Set cooldown so we don't re-engage immediately
             if self.leaving_from:
-                self.goodbye_cooldown[self.leaving_from] = 8  # 8 turns before we can talk to them again
+                self.goodbye_cooldown[self.leaving_from] = 20  # 20 turns before we can talk to them again
             self.must_leave = False
             self.leaving_from = None
+            
+            # Pick a random direction and commit to it
+            # random imported at top
+            if valid_moves:
+                self.traveling_direction = random.choice(valid_moves)
+                self.traveling_turns = 6  # Keep going this direction for 6 turns
             
             prompt = f"""You are {self.name}, exploring the world.
 {history_context}
 {text_desc}
 
-You just said goodbye to someone. Time to explore NEW areas far away!
-Pick a direction and KEEP GOING that way.
+You just said goodbye. Time to explore far away!
+Go {self.traveling_direction.upper()} to find new places!
 ✅ Valid moves: {', '.join(valid_moves)}
-❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
 
-Reply with ONLY one of: move north | move south | move east | move west"""
+Reply with ONLY: move {self.traveling_direction}"""
+            return prompt, "move", None
+        
+        # PRIORITY 5: Currently traveling away from someone
+        if self.traveling_turns > 0:
+            self.traveling_turns -= 1
+            
+            # Try to keep going same direction, or pick new one if blocked
+            if self.traveling_direction in valid_moves:
+                direction = self.traveling_direction
+            else:
+                # random imported at top
+                direction = random.choice(valid_moves) if valid_moves else "south"
+                self.traveling_direction = direction
+            
+            prompt = f"""You are {self.name}, exploring the world.
+{text_desc}
+
+Keep exploring! Go {direction.upper()}.
+✅ Valid moves: {', '.join(valid_moves)}
+
+Reply with ONLY: move {direction}"""
             return prompt, "move", None
         
         # Decrement all goodbye cooldowns
@@ -348,15 +382,22 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             # Check if we're in goodbye cooldown with this person
             if other_id in self.goodbye_cooldown:
                 remaining = self.goodbye_cooldown[other_id]
+                
+                # Use traveling direction if set, otherwise pick one
+                if not self.traveling_direction or self.traveling_direction not in valid_moves:
+                    import random
+                    if valid_moves:
+                        self.traveling_direction = random.choice(valid_moves)
+                
                 prompt = f"""You are {self.name}, exploring the world.
 {history_context}
 {text_desc}
 
-You recently said goodbye to {other_name}. Keep exploring elsewhere for now!
+You recently said goodbye to {other_name}. Keep moving away!
+Go {self.traveling_direction.upper()} to explore new areas.
 ✅ Valid moves: {', '.join(valid_moves)}
-❌ Blocked: {', '.join(blocked_moves) if blocked_moves else 'none'}
 
-Reply with ONLY one of: move north | move south | move east | move west"""
+Reply with ONLY: move {self.traveling_direction}"""
                 return prompt, "move", None
             
             # Build actual conversation history from server
@@ -371,18 +412,36 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     else:
                         convo_history += f'  {speaker}: "{msg}"\n'
             
-            # Find what they JUST said to us
+            # Find what they JUST said to us (must be very recent - within last 3 ticks)
             last_said_to_me = None
+            last_said_tick = 0
+            current_tick = state.get("world", {}).get("tick", 0)
             for c in reversed(recent_convos):
                 if c.get("listener_id") == self.char_id:
-                    last_said_to_me = c.get("message")
+                    msg_tick = c.get("tick", 0)
+                    # Only consider messages from the last 3 ticks as "just said"
+                    if current_tick - msg_tick <= 3:
+                        last_said_to_me = c.get("message")
+                        last_said_tick = msg_tick
                     break
             
-            # Check if they said goodbye - we should acknowledge and leave too
+            # Check if they said goodbye RECENTLY - we should acknowledge and leave too
+            # But NOT if we already said goodbye (check our recent messages)
             if last_said_to_me:
                 goodbye_phrases = ['goodbye', 'farewell', 'adieu', 'bye', 'see you', 'until next', 'take care', 'been delightful', 'bid you', 'should go', 'must go', 'heading off']
                 said_goodbye = any(phrase in last_said_to_me.lower() for phrase in goodbye_phrases)
-                if said_goodbye:
+                
+                # Check if WE already said goodbye recently (avoid goodbye ping-pong)
+                we_said_goodbye_recently = False
+                for c in reversed(recent_convos):
+                    if c.get("speaker_id") == self.char_id:
+                        msg_tick = c.get("tick", 0)
+                        if current_tick - msg_tick <= 5:
+                            if any(phrase in c.get("message", "").lower() for phrase in goodbye_phrases):
+                                we_said_goodbye_recently = True
+                        break
+                
+                if said_goodbye and not we_said_goodbye_recently:
                     # They said goodbye - acknowledge it and leave
                     prompt = f"""You are {self.name}.
 {other_name} is saying goodbye: "{last_said_to_me[:100]}"

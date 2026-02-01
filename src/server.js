@@ -962,7 +962,8 @@ app.get('/api/characters', async (req, res) => {
   try {
     const chars = await pool.query(`
       SELECT id, name, emoji, x, y, hp, max_hp, xp, level, 
-             turn_interval, is_active, created_at, last_seen_at
+             turn_interval, is_active, created_at, last_seen_at,
+             COALESCE(energy, 100) as energy, COALESCE(max_energy, 100) as max_energy
       FROM characters
       ORDER BY xp DESC
     `);

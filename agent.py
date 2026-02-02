@@ -83,6 +83,11 @@ class LLMRPGAgent:
         # Post-goodbye cooldown - don't talk to same person for X turns
         self.goodbye_cooldown = {}  # {char_id: turns_remaining}
         
+        # CONVERSATION STATE MACHINE
+        self.conversation_state = {}  # {char_id: "idle" | "waiting" | "talking"}
+        self.last_seen_msg = {}  # {char_id: tick of last message we processed from them}
+        self.waiting_since = {}  # {key: tick when we started waiting}
+        
         # Track when we last talked to each character (for greetings)
         self.last_talked_tick = {}  # {char_id: tick}
         
@@ -320,7 +325,6 @@ TOPICS: [topic1, topic2, topic3]"""
         """Build a prompt for Ollama based on world state and action history."""
         
         text_desc = state.get("textDescription", "")
-        nearby_chars = state.get("nearbyCharacters", [])
         recent_convos = state.get("recentConversations", [])
         can_talk = state.get("canTalk", False)
         valid_moves = state.get("validMoves", [])
@@ -328,6 +332,15 @@ TOPICS: [topic1, topic2, topic3]"""
         rest_spots = state.get("restSpotsNearby", [])
         food_spots = state.get("foodSpotsNearby", [])
         is_night = state.get("world", {}).get("isNight", False)
+        current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+        
+        # Filter nearby characters to ONLY include online characters (acted in last 10 ticks)
+        all_nearby = state.get("nearbyCharacters", [])
+        nearby_chars = []
+        for nc in all_nearby:
+            nc_last_action = int(nc.get("last_action_tick", 0) or 0)
+            if current_tick - nc_last_action <= 10:
+                nearby_chars.append(nc)
         
         # Environmental context
         current_location = state.get("currentLocation", "open meadow")
@@ -653,6 +666,13 @@ Reply with ONLY: move {direction}"""
                 if char_id in self.conversation_memory:
                     self.conversation_memory[char_id] = []
                     self.discussed_topics[char_id] = set()
+                # Clear conversation state
+                if char_id in self.conversation_state:
+                    del self.conversation_state[char_id]
+                if char_id in self.last_seen_msg:
+                    del self.last_seen_msg[char_id]
+                self.waiting_since.pop(char_id, None)
+                self.waiting_since.pop(f"init_{char_id}", None)
                 # Clear last_talked so we greet them again
                 if char_id in self.last_talked_tick:
                     del self.last_talked_tick[char_id]
@@ -721,60 +741,115 @@ Reply with ONLY: move {direction}"""
                 best_direction = safe_directions[0] if safe_directions else 'south'
                 return None, f"direct_move_{best_direction}", None
             
-            # PROPER TURN-TAKING using local state
-            # Track: did we send a message that hasn't been responded to yet?
+            # ═══════════════════════════════════════════════════════════════
+            # STRICT CONVERSATION STATE MACHINE
+            # States: IDLE -> TALKING -> WAITING -> TALKING -> ... -> DONE
+            # Rule: NEVER speak while in WAITING state until response received
+            # ═══════════════════════════════════════════════════════════════
             
-            # Check server for their most recent message TO US
-            their_last_to_us = 0
-            for c in reversed(recent_convos[-20:]):
+            # Get our conversation state with this person
+            conv_state = self.conversation_state.get(other_id, "idle")
+            last_seen_from_them = self.last_seen_msg.get(other_id, 0)
+            
+            # CRITICAL: If we've never tracked this person before, initialize last_seen to NOW
+            # This prevents old messages from being treated as "new"
+            if last_seen_from_them == 0:
+                self.last_seen_msg[other_id] = current_tick
+                last_seen_from_them = current_tick
+                print(f"   🆕 First encounter with {other_name}, ignoring old messages")
+            
+            # Check for NEW message from them (tick > what we've already seen)
+            # IMPORTANT: Find the NEWEST message from them (highest tick that's new to us)
+            their_new_msg_tick = 0
+            msgs_from_them = []
+            for c in recent_convos:
                 if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
-                    their_last_to_us = int(c.get("tick", 0) or 0)
-                    break
+                    msg_tick = int(c.get("tick", 0) or 0)
+                    msgs_from_them.append(msg_tick)
+                    if msg_tick > last_seen_from_them and msg_tick > their_new_msg_tick:
+                        their_new_msg_tick = msg_tick
             
-            # Check if we're waiting for this person to respond
-            waiting_since = self.last_talked_tick.get(f"waiting_{other_id}", 0)
-            
-            if waiting_since > 0:
-                # We're waiting - check if they responded
-                if their_last_to_us > waiting_since:
-                    # They responded! Clear waiting state
-                    print(f"   ✅ {other_name} responded at tick {their_last_to_us}")
-                    self.last_talked_tick[f"waiting_{other_id}"] = 0
+            if conv_state == "waiting" and not their_new_msg_tick:
+                # Show what messages we DO have from them for debugging
+                if msgs_from_them:
+                    print(f"   🔍 DEBUG: Have msgs from {other_name} at ticks {msgs_from_them}, but last_seen={last_seen_from_them}")
                 else:
-                    # Still waiting
-                    ticks_waiting = current_tick - waiting_since
-                    if ticks_waiting < 10:
-                        print(f"   ⏳ Waiting for {other_name}'s response (sent at tick {waiting_since}, now {current_tick})")
+                    # Check if there are ANY messages from them in recent_convos
+                    all_msgs = [(c.get("speaker_name"), c.get("listener_id"), c.get("tick")) for c in recent_convos[-5:]]
+                    print(f"   🔍 DEBUG: No msgs from {other_name} to us. Recent convos: {all_msgs}")
+            
+            other_last_action = int(other.get("last_action_tick", 0) or 0)
+            print(f"   📊 State: {conv_state}, last_seen={last_seen_from_them}, new_msg={their_new_msg_tick}, now={current_tick}")
+            
+            # STATE: WAITING - We sent a message, waiting for their response
+            if conv_state == "waiting":
+                if their_new_msg_tick > 0:
+                    # They responded! Transition to TALKING
+                    print(f"   ✅ {other_name} responded at tick {their_new_msg_tick}")
+                    self.last_seen_msg[other_id] = their_new_msg_tick
+                    self.conversation_state[other_id] = "talking"
+                    self.waiting_since.pop(other_id, None)
+                    # Fall through to conversation logic
+                else:
+                    # Still waiting - check timeout
+                    wait_start = self.waiting_since.get(other_id, current_tick)
+                    ticks_waiting = current_tick - wait_start
+                    if ticks_waiting < 12:
+                        print(f"   ⏳ WAITING for {other_name}'s response ({ticks_waiting}/12 ticks)")
                         time.sleep(3)
                         return None, "skip", None
                     else:
-                        # Timeout
-                        print(f"   😤 {other_name} not responding after {ticks_waiting} ticks")
-                        self.last_talked_tick[f"waiting_{other_id}"] = 0
+                        # Timeout - end conversation
+                        print(f"   😤 TIMEOUT: {other_name} not responding")
+                        self.conversation_state[other_id] = "idle"
+                        self.waiting_since.pop(other_id, None)
                         self.goodbye_cooldown[other_id] = 30
-                        prompt = f"""You are {self.name}. {other_name} isn't responding.
+                        prompt = f"""You are {self.name}. {other_name} seems distracted.
 Say a brief goodbye. One sentence:"""
                         return prompt, "goodbye", other_id
             
-            # Not waiting - but should we initiate?
-            # TIE-BREAKER: Higher ID never initiates, always waits for lower ID
-            # EXCEPTION: If they're OFFLINE (haven't acted in 10 ticks), we can initiate
-            if their_last_to_us == 0 or current_tick - their_last_to_us > 20:
-                # They haven't spoken to us recently - this is a new conversation
-                if self.char_id > other_id:
-                    # Check if they're online (acted recently)
-                    other_last_action = int(other.get("last_action_tick", 0) or 0)
-                    is_online = current_tick - other_last_action <= 10
-                    
-                    if is_online:
-                        print(f"   ⏳ Letting {other_name} initiate (they have lower ID)")
-                        time.sleep(2)
-                        return None, "skip", None
+            # STATE: IDLE - Not in conversation
+            elif conv_state == "idle":
+                if their_new_msg_tick > 0:
+                    # They initiated! Transition to TALKING to respond
+                    print(f"   📨 {other_name} initiated at tick {their_new_msg_tick}")
+                    self.last_seen_msg[other_id] = their_new_msg_tick
+                    self.conversation_state[other_id] = "talking"
+                    # Fall through to conversation logic
+                else:
+                    # Neither talking - determine who initiates (lower ID)
+                    if self.char_id > other_id:
+                        # Check if they're online
+                        if current_tick - other_last_action > 10:
+                            print(f"   💤 {other_name} is offline")
+                            return None, "move", None
+                        
+                        # Wait for them to initiate (with timeout)
+                        init_key = f"init_{other_id}"
+                        wait_start = self.waiting_since.get(init_key, 0)
+                        if wait_start == 0:
+                            self.waiting_since[init_key] = current_tick
+                            print(f"   ⏳ Letting {other_name} initiate (lower ID) - tick 1/6")
+                            time.sleep(2)
+                            return None, "skip", None
+                        elif current_tick - wait_start < 6:
+                            print(f"   ⏳ Letting {other_name} initiate ({current_tick - wait_start}/6 ticks)")
+                            time.sleep(2)
+                            return None, "skip", None
+                        else:
+                            # Timeout - we initiate instead
+                            print(f"   🗣️ Initiating (waited {current_tick - wait_start} ticks)")
+                            self.waiting_since.pop(init_key, None)
+                            self.conversation_state[other_id] = "talking"
+                            # Fall through to conversation logic
                     else:
-                        # They're offline - skip them and look for someone else
-                        print(f"   💤 {other_name} is idle (last action tick {other_last_action})")
-                        # Move on to find someone else
-                        return None, "move", None
+                        # We have lower ID - we initiate
+                        print(f"   🗣️ Initiating (we have lower ID)")
+                        self.conversation_state[other_id] = "talking"
+                        # Fall through to conversation logic
+            
+            # STATE: TALKING - Continue below to generate response
+            # (Already in talking state, or just transitioned)
             
             # Check if we're in goodbye cooldown with this person
             if other_id in self.goodbye_cooldown:
@@ -1170,10 +1245,12 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                       f"⚡{energy} │ 🍖{hunger}")
                 print(f"Position: {current_pos}")
                 
-                # Show who's nearby
+                # Show who's nearby (only online characters)
                 nearby = state.get('nearbyCharacters', [])
-                if nearby:
-                    names = [f"{c.get('emoji','')} {c['name']}" for c in nearby[:3]]
+                current_tick_display = int(state.get('world', {}).get('tick', 0) or 0)
+                online_nearby = [c for c in nearby if current_tick_display - int(c.get('last_action_tick', 0) or 0) <= 10]
+                if online_nearby:
+                    names = [f"{c.get('emoji','')} {c['name']}" for c in online_nearby[:3]]
                     print(f"Nearby: {', '.join(names)}")
                 
                 print(f"{'─' * 50}")
@@ -1181,17 +1258,21 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 # Build prompt with action history
                 prompt, expected_type, talk_target_id = self.build_prompt(state)
                 
-                # Debug: show decision state
+                # Debug: show decision state (only online characters)
                 nearby = state.get("nearbyCharacters", [])
-                if nearby:
-                    for n in nearby:
-                        nid = n.get("id", n["name"])
-                        in_cooldown = nid in self.goodbye_cooldown
-                        cd_remaining = self.goodbye_cooldown.get(nid, 0)
-                        fatigue = n.get("conversationFatigue", {})
-                        summaries = fatigue.get("summaries", [])
-                        sum_count = len(summaries) if summaries else 0
-                        print(f"   👁️ See {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining}) memories={sum_count}")
+                current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+                for n in nearby:
+                    nid = n.get("id", n["name"])
+                    last_action = int(n.get("last_action_tick", 0) or 0)
+                    # Skip offline characters in debug display
+                    if current_tick - last_action > 10:
+                        continue
+                    in_cooldown = nid in self.goodbye_cooldown
+                    cd_remaining = self.goodbye_cooldown.get(nid, 0)
+                    fatigue = n.get("conversationFatigue", {})
+                    summaries = fatigue.get("summaries", [])
+                    sum_count = len(summaries) if summaries else 0
+                    print(f"   👁️ {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining}) memories={sum_count}")
                 
                 print(f"🤔 Thinking... (mode: {expected_type})")
                 
@@ -1219,16 +1300,21 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     message = params["message"]
                     is_goodbye = params.get("is_goodbye", False)
                     
-                    # Set waiting state - we spoke, now wait for their response
-                    if talk_target_id and not is_goodbye:
+                    # STATE MACHINE: After speaking, transition to WAITING
+                    if talk_target_id:
                         current_tick = int(state.get("world", {}).get("tick", 0) or 0)
-                        self.last_talked_tick[f"waiting_{talk_target_id}"] = current_tick
+                        if is_goodbye:
+                            # End of conversation - back to IDLE
+                            self.conversation_state[talk_target_id] = "idle"
+                            self.waiting_since.pop(talk_target_id, None)
+                            self.last_seen_msg.pop(talk_target_id, None)
+                        else:
+                            # Transition to WAITING for their response
+                            self.conversation_state[talk_target_id] = "waiting"
+                            self.waiting_since[talk_target_id] = current_tick
                     
                     if is_goodbye:
                         print(f'👋 "{message}"')
-                        # Clear waiting state
-                        if talk_target_id:
-                            self.last_talked_tick[f"waiting_{talk_target_id}"] = 0
                         # Set flag to force movement on next turn
                         self.must_leave = True
                         self.leaving_from = talk_target_id

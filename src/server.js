@@ -914,20 +914,54 @@ app.post('/api/action/:charId', async (req, res) => {
           });
         }
         
-        // Find nearby character to talk to
-        const nearby = await pool.query(`
-          SELECT id, name FROM characters
-          WHERE id != $1 AND is_active = true
-            AND ABS(x - $2) <= 2 AND ABS(y - $3) <= 2
-          ORDER BY SQRT(POWER(x - $2, 2) + POWER(y - $3, 2))
-          LIMIT 1
-        `, [charId, me.x, me.y]);
+        // Find the target character to talk to
+        // If target is specified, use that; otherwise find nearest online character
+        let listener;
+        const { target } = req.body;
         
-        if (nearby.rows.length === 0) {
-          return res.status(400).json({ error: 'No one nearby to talk to' });
+        if (target) {
+          // Use specified target - verify they're nearby and online
+          const targetResult = await pool.query(`
+            SELECT id, name FROM characters
+            WHERE id = $1 AND is_active = true
+              AND ABS(x - $2) <= 2 AND ABS(y - $3) <= 2
+              AND last_action_tick > (SELECT tick FROM world WHERE id = 1) - 10
+          `, [target, me.x, me.y]);
+          
+          if (targetResult.rows.length === 0) {
+            // Target not found or offline/too far - fall back to nearest
+            const nearby = await pool.query(`
+              SELECT id, name FROM characters
+              WHERE id != $1 AND is_active = true
+                AND ABS(x - $2) <= 2 AND ABS(y - $3) <= 2
+                AND last_action_tick > (SELECT tick FROM world WHERE id = 1) - 10
+              ORDER BY SQRT(POWER(x - $2, 2) + POWER(y - $3, 2))
+              LIMIT 1
+            `, [charId, me.x, me.y]);
+            
+            if (nearby.rows.length === 0) {
+              return res.status(400).json({ error: 'No one nearby to talk to' });
+            }
+            listener = nearby.rows[0];
+          } else {
+            listener = targetResult.rows[0];
+          }
+        } else {
+          // No target specified - find nearest online character
+          const nearby = await pool.query(`
+            SELECT id, name FROM characters
+            WHERE id != $1 AND is_active = true
+              AND ABS(x - $2) <= 2 AND ABS(y - $3) <= 2
+              AND last_action_tick > (SELECT tick FROM world WHERE id = 1) - 10
+            ORDER BY SQRT(POWER(x - $2, 2) + POWER(y - $3, 2))
+            LIMIT 1
+          `, [charId, me.x, me.y]);
+          
+          if (nearby.rows.length === 0) {
+            return res.status(400).json({ error: 'No one nearby to talk to' });
+          }
+          listener = nearby.rows[0];
         }
-        
-        const listener = nearby.rows[0];
         
         // Check conversation fatigue/cooldown
         const relCheck = await pool.query(`

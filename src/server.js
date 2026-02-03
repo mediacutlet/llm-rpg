@@ -105,6 +105,170 @@ const XP_REWARDS = {
   first_meeting: 20
 };
 
+// ============== SERVER-SIDE PROTECTIONS ==============
+// These cannot be bypassed by agent modifications
+
+// Rate limits: { action: { maxPerWindow, windowTicks } }
+const RATE_LIMITS = {
+  talk: { maxPerWindow: 2, windowTicks: 4 },   // Max 2 talks per 4 ticks (~20 sec)
+  move: { maxPerWindow: 5, windowTicks: 2 },   // Max 5 moves per 2 ticks (~10 sec)  
+  think: { maxPerWindow: 2, windowTicks: 10 }, // Max 2 thinks per 10 ticks
+};
+
+// Check if action is rate limited
+async function checkRateLimit(charId, actionType, currentTick) {
+  const limit = RATE_LIMITS[actionType];
+  if (!limit) return { allowed: true };
+  
+  const windowStart = currentTick - limit.windowTicks;
+  
+  // Count recent actions of this type
+  const result = await pool.query(`
+    SELECT COUNT(*) as count FROM rate_limits 
+    WHERE character_id = $1 AND action_type = $2 AND action_tick > $3
+  `, [charId, actionType, windowStart]);
+  
+  const count = parseInt(result.rows[0].count);
+  
+  if (count >= limit.maxPerWindow) {
+    return { 
+      allowed: false, 
+      error: `Rate limited: max ${limit.maxPerWindow} ${actionType} actions per ${limit.windowTicks} ticks`,
+      retryAfterTicks: limit.windowTicks
+    };
+  }
+  
+  return { allowed: true };
+}
+
+// Record an action for rate limiting
+async function recordAction(charId, actionType, currentTick) {
+  try {
+    await pool.query(`
+      INSERT INTO rate_limits (character_id, action_type, action_tick) 
+      VALUES ($1, $2, $3)
+      ON CONFLICT DO NOTHING
+    `, [charId, actionType, currentTick]);
+    
+    // Clean up old rate limit records (older than 100 ticks)
+    await pool.query(`
+      DELETE FROM rate_limits WHERE action_tick < $1
+    `, [currentTick - 100]);
+  } catch (e) {
+    // Non-critical, continue
+  }
+}
+
+// Check for consecutive messages (spam prevention)
+// Returns error if same person sent 2+ messages without response
+async function checkConsecutiveMessages(speakerId, listenerId, currentTick) {
+  // Get the relationship record
+  const rel = await pool.query(`
+    SELECT last_speaker_id, consecutive_count, last_message_tick
+    FROM relationships 
+    WHERE char1_id = $1 AND char2_id = $2
+  `, [speakerId, listenerId]);
+  
+  if (rel.rows.length === 0) {
+    return { allowed: true }; // New relationship, allow
+  }
+  
+  const { last_speaker_id, consecutive_count, last_message_tick } = rel.rows[0];
+  
+  // If it's been more than 20 ticks, reset the consecutive count
+  if (currentTick - (last_message_tick || 0) > 20) {
+    return { allowed: true };
+  }
+  
+  // If the same person sent the last message AND count is >= 2
+  if (last_speaker_id === speakerId && (consecutive_count || 0) >= 2) {
+    return { 
+      allowed: false, 
+      error: `Wait for ${listenerId.split('-')[0]} to respond before sending another message`,
+      consecutiveLimit: true
+    };
+  }
+  
+  return { allowed: true };
+}
+
+// Update consecutive message tracking
+async function updateMessageTracking(speakerId, listenerId, currentTick) {
+  // Check if relationship exists
+  const existing = await pool.query(`
+    SELECT last_speaker_id FROM relationships 
+    WHERE char1_id = $1 AND char2_id = $2
+  `, [speakerId, listenerId]);
+  
+  if (existing.rows.length === 0) {
+    // Will be created by the main talk handler
+    return;
+  }
+  
+  const lastSpeaker = existing.rows[0].last_speaker_id;
+  
+  if (lastSpeaker === speakerId) {
+    // Same speaker, increment consecutive count
+    await pool.query(`
+      UPDATE relationships 
+      SET consecutive_count = COALESCE(consecutive_count, 0) + 1,
+          last_message_tick = $3
+      WHERE char1_id = $1 AND char2_id = $2
+    `, [speakerId, listenerId, currentTick]);
+  } else {
+    // Different speaker, reset count
+    await pool.query(`
+      UPDATE relationships 
+      SET last_speaker_id = $1, consecutive_count = 1, last_message_tick = $4
+      WHERE char1_id = $2 AND char2_id = $3
+    `, [speakerId, speakerId, listenerId, currentTick]);
+  }
+}
+
+// Check goodbye cooldown (server-enforced)
+async function checkGoodbyeCooldown(char1Id, char2Id, currentTick) {
+  const rel = await pool.query(`
+    SELECT goodbye_cooldown_until FROM relationships 
+    WHERE char1_id = $1 AND char2_id = $2
+  `, [char1Id, char2Id]);
+  
+  if (rel.rows.length === 0) return { allowed: true };
+  
+  const cooldownUntil = rel.rows[0].goodbye_cooldown_until || 0;
+  
+  if (currentTick < cooldownUntil) {
+    const ticksLeft = cooldownUntil - currentTick;
+    return {
+      allowed: false,
+      error: `Give ${char2Id.split('-')[0]} some space. You can talk again in ${ticksLeft} ticks.`,
+      goodbyeCooldown: true,
+      ticksLeft
+    };
+  }
+  
+  return { allowed: true };
+}
+
+// Set goodbye cooldown
+async function setGoodbyeCooldown(char1Id, char2Id, currentTick, cooldownTicks = 30) {
+  await pool.query(`
+    UPDATE relationships 
+    SET goodbye_cooldown_until = $3,
+        consecutive_count = 0,
+        last_speaker_id = NULL
+    WHERE char1_id = $1 AND char2_id = $2
+  `, [char1Id, char2Id, currentTick + cooldownTicks]);
+  
+  // Also set the reverse relationship
+  await pool.query(`
+    UPDATE relationships 
+    SET goodbye_cooldown_until = $3,
+        consecutive_count = 0,
+        last_speaker_id = NULL
+    WHERE char1_id = $2 AND char2_id = $1
+  `, [char1Id, char2Id, currentTick + cooldownTicks]);
+}
+
 // ============== LIFE STORY EVOLUTION ==============
 
 // Add a significant moment to a character's life story
@@ -851,6 +1015,12 @@ app.post('/api/action/:charId', async (req, res) => {
     
     switch (action) {
       case 'move': {
+        // Rate limit check
+        const moveRateCheck = await checkRateLimit(charId, 'move', tick);
+        if (!moveRateCheck.allowed) {
+          return res.status(429).json({ error: moveRateCheck.error, rateLimited: true });
+        }
+        
         const dirs = {
           north: [0, -1], south: [0, 1],
           east: [1, 0], west: [-1, 0]
@@ -878,6 +1048,9 @@ app.post('/api/action/:charId', async (req, res) => {
           return res.status(400).json({ error: `${blocking.rows[0].name} blocks your path` });
         }
         
+        // Record action for rate limiting
+        await recordAction(charId, 'move', tick);
+        
         await pool.query(
           'UPDATE characters SET x = $1, y = $2 WHERE id = $3',
           [newX, newY, charId]
@@ -901,6 +1074,14 @@ app.post('/api/action/:charId', async (req, res) => {
       case 'talk': {
         if (!message) {
           return res.status(400).json({ error: 'Message is required' });
+        }
+        
+        // ====== SERVER-SIDE PROTECTION CHECKS ======
+        
+        // 1. Rate limit check
+        const talkRateCheck = await checkRateLimit(charId, 'talk', tick);
+        if (!talkRateCheck.allowed) {
+          return res.status(429).json({ error: talkRateCheck.error, rateLimited: true });
         }
         
         // Check energy
@@ -963,7 +1144,28 @@ app.post('/api/action/:charId', async (req, res) => {
           listener = nearby.rows[0];
         }
         
-        // Check conversation fatigue/cooldown
+        // 2. Goodbye cooldown check (server-enforced)
+        const goodbyeCheck = await checkGoodbyeCooldown(charId, listener.id, tick);
+        if (!goodbyeCheck.allowed) {
+          return res.status(400).json({ 
+            error: goodbyeCheck.error, 
+            goodbyeCooldown: true,
+            ticksLeft: goodbyeCheck.ticksLeft
+          });
+        }
+        
+        // 3. Consecutive message check (spam prevention)
+        const consecutiveCheck = await checkConsecutiveMessages(charId, listener.id, tick);
+        if (!consecutiveCheck.allowed) {
+          return res.status(400).json({ 
+            error: consecutiveCheck.error, 
+            consecutiveLimit: true
+          });
+        }
+        
+        // ====== END PROTECTION CHECKS ======
+        
+        // Check conversation fatigue/cooldown (existing logic)
         const relCheck = await pool.query(`
           SELECT recent_exchanges, cooldown_until_tick 
           FROM relationships 
@@ -1070,6 +1272,26 @@ app.post('/api/action/:charId', async (req, res) => {
         }
         // Removed the intermediate warnings - let conversations flow naturally
         
+        // ====== POST-TALK TRACKING ======
+        
+        // Record action for rate limiting
+        await recordAction(charId, 'talk', tick);
+        
+        // Update consecutive message tracking
+        await updateMessageTracking(charId, listener.id, tick);
+        
+        // Detect goodbye messages and set server-enforced cooldown
+        const lowerMessage = message.toLowerCase();
+        const goodbyePatterns = ['goodbye', 'farewell', 'see you', 'take care', 'bye', 'gotta go', 'should go', 'must go'];
+        const isGoodbye = goodbyePatterns.some(pattern => lowerMessage.includes(pattern));
+        
+        if (isGoodbye) {
+          // Set a 25-tick cooldown after goodbye (server-enforced)
+          await setGoodbyeCooldown(charId, listener.id, tick, 25);
+        }
+        
+        // ====== END TRACKING ======
+        
         result = { 
           success: true, 
           message: msg, 
@@ -1078,7 +1300,8 @@ app.post('/api/action/:charId', async (req, res) => {
           energy: currentEnergy - energyCost,
           exchangeCount: newExchangeCount,
           fatigueWarning,
-          cooldownIn: newCooldown > 0 ? 0 : (15 - newExchangeCount)
+          cooldownIn: newCooldown > 0 ? 0 : (15 - newExchangeCount),
+          isGoodbye  // Let client know if this was detected as a goodbye
         };
         break;
       }
@@ -1204,8 +1427,32 @@ app.post('/api/action/:charId', async (req, res) => {
         break;
       }
       
+      case 'think': {
+        // Rate limit check
+        const thinkRateCheck = await checkRateLimit(charId, 'think', tick);
+        if (!thinkRateCheck.allowed) {
+          return res.status(429).json({ error: thinkRateCheck.error, rateLimited: true });
+        }
+        
+        // Character is thinking/saving a memory
+        const thinkingAbout = target || 'something';
+        
+        // Record action for rate limiting
+        await recordAction(charId, 'think', tick);
+        
+        await pool.query(
+          'INSERT INTO activity_log (tick, character_id, action, message) VALUES ($1, $2, $3, $4)',
+          [tick, charId, 'think', `${me.name} is saving a memory...`]
+        );
+        
+        broadcast('think', { id: charId, name: me.name, emoji: me.emoji, about: thinkingAbout });
+        
+        result = { success: true, thinking: true };
+        break;
+      }
+      
       default:
-        return res.status(400).json({ error: 'Unknown action. Use: move, talk, examine, interact' });
+        return res.status(400).json({ error: 'Unknown action. Use: move, talk, examine, interact, think' });
     }
     
     // Update last action tick

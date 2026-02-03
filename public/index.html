@@ -169,6 +169,22 @@
       filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));
     }
     
+    .thinking-bubble {
+      position: absolute;
+      top: -18px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 14px;
+      animation: float-bubble 1.5s ease-in-out infinite;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,0.3));
+      z-index: 20;
+    }
+    
+    @keyframes float-bubble {
+      0%, 100% { transform: translateX(-50%) translateY(0); opacity: 1; }
+      50% { transform: translateX(-50%) translateY(-5px); opacity: 0.8; }
+    }
+    
     .sidebar { display: flex; flex-direction: column; gap: 15px; }
     
     .leaderboard { list-style: none; }
@@ -378,7 +394,8 @@
           cells[idx].classList.add('has-character');
           if (chars.length > 1) cells[idx].classList.add('has-multiple');
           const display = chars.length > 1 ? chars.map(c => c.emoji).join('') : chars[0].emoji;
-          cells[idx].innerHTML = `<span class="character-marker" title="${chars.map(c => `${c.name} (L${c.level})`).join(', ')}">${display}</span>`;
+          const thinkingBubble = chars.some(c => c.thinking) ? '<span class="thinking-bubble">💭</span>' : '';
+          cells[idx].innerHTML = `<span class="character-marker" title="${chars.map(c => `${c.name} (L${c.level})`).join(', ')}">${thinkingBubble}${display}</span>`;
         }
       }
     }
@@ -461,6 +478,10 @@
               isConvo: true
             };
           }
+        }
+        // Show think action with thought bubble emoji
+        if (a.action === 'think') {
+          return { ...a, emoji: '💭', isConvo: false };
         }
         return { ...a, isConvo: false };
       });
@@ -558,6 +579,20 @@
         if (char && data.newEnergy !== undefined) {
           char.energy = data.newEnergy;
           renderLeaderboard();
+        }
+      });
+      
+      eventSource.addEventListener('think', (e) => {
+        const data = JSON.parse(e.data);
+        const char = worldData.characters.find(c => c.id === data.id);
+        if (char) {
+          char.thinking = true;
+          renderWorld();
+          // Clear thinking state after 5 seconds
+          setTimeout(() => {
+            char.thinking = false;
+            renderWorld();
+          }, 5000);
         }
       });
     }

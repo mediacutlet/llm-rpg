@@ -18,7 +18,6 @@ import argparse
 import requests
 import json
 import time
-import subprocess
 import sys
 import random
 import re
@@ -27,25 +26,34 @@ DEFAULT_MODEL = "llama3"  # Change to your preferred model
 POLL_INTERVAL = 2  # Seconds between checking if we can act
 
 
-def ollama_generate(prompt: str, model: str) -> str:
-    """Call local Ollama to generate a response."""
+def ollama_generate(prompt: str, model: str, temperature: float = 0.8) -> str:
+    """Call local Ollama API to generate a response with temperature control."""
     try:
-        result = subprocess.run(
-            ["ollama", "run", model, "--nowordwrap"],
-            input=prompt,
-            capture_output=True,
-            text=True,
+        import requests
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": 150  # Limit response length
+                }
+            },
             timeout=120
         )
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
+        if response.status_code == 200:
+            return response.json().get("response", "").strip()
+        else:
+            print(f"  ⚠️ Ollama API error: {response.status_code}")
+            return "move east"
+    except requests.exceptions.ConnectionError:
+        print("  ❌ Cannot connect to Ollama. Is it running? (ollama serve)")
+        sys.exit(1)
+    except requests.exceptions.Timeout:
         print("  ⚠️ Ollama timeout, using fallback")
         return "move east"
-    except FileNotFoundError:
-        print("  ❌ Ollama not found. Is it installed and running?")
-        print("     Install: https://ollama.ai")
-        print("     Then run: ollama serve")
-        sys.exit(1)
     except Exception as e:
         print(f"  ⚠️ Ollama error: {e}")
         return "move east"
@@ -222,6 +230,13 @@ class LLMRPGAgent:
             timeout=10
         )
         return r.json()
+    
+    def send_think(self, about: str = ""):
+        """Send a 'thinking' action to show thought bubble on frontend."""
+        try:
+            self.act("think", target=about)
+        except Exception:
+            pass  # Non-critical, don't fail if this errors
     
     def save_summary(self, other_id: str, title: str, summary: str, topics: list) -> bool:
         """Save a conversation summary to the server."""
@@ -474,7 +489,7 @@ TOPICS: [topic1, topic2, topic3]"""
         convo_context = ""
         if recent_convos:
             convo_context = "\nRecent conversation:\n"
-            for c in recent_convos[-3:]:
+            for c in recent_convos[-6:]:  # Last 6 messages for better context
                 speaker = c.get("speaker_name", "Someone")
                 msg = c.get("message", "")
                 convo_context += f'  {speaker}: "{msg}"\n'
@@ -637,25 +652,41 @@ Reply with ONLY: move {self.traveling_direction}"""
             return prompt, "move", None
         
         # PRIORITY 5: Currently traveling away from someone
+        # BUT if someone new spoke to us, cancel traveling to respond
         if self.traveling_turns > 0:
-            self.traveling_turns -= 1
+            # Check if anyone spoke to us recently (worth stopping for)
+            current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+            someone_spoke = False
+            for c in reversed(recent_convos[-5:]):
+                if c.get("listener_id") == self.char_id:
+                    msg_tick = int(c.get("tick", 0) or 0)
+                    speaker_id = c.get("speaker_id")
+                    # Someone spoke to us in the last 5 ticks AND they're not in cooldown
+                    if current_tick - msg_tick <= 5 and speaker_id not in self.goodbye_cooldown:
+                        someone_spoke = True
+                        print(f"   📨 Someone spoke to us while traveling, stopping to respond")
+                        self.traveling_turns = 0
+                        break
             
-            # Try to keep going same direction, or pick new one if blocked
-            if self.traveling_direction in valid_moves:
-                direction = self.traveling_direction
-            else:
-                # random imported at top
-                direction = random.choice(valid_moves) if valid_moves else "south"
-                self.traveling_direction = direction
-            
-            prompt = f"""You are {self.name}, exploring the world.
+            if self.traveling_turns > 0:  # Still traveling
+                self.traveling_turns -= 1
+                
+                # Try to keep going same direction, or pick new one if blocked
+                if self.traveling_direction in valid_moves:
+                    direction = self.traveling_direction
+                else:
+                    # random imported at top
+                    direction = random.choice(valid_moves) if valid_moves else "south"
+                    self.traveling_direction = direction
+                
+                prompt = f"""You are {self.name}, exploring the world.
 {text_desc}
 
 Keep exploring! Go {direction.upper()}.
 ✅ Valid moves: {', '.join(valid_moves)}
 
 Reply with ONLY: move {direction}"""
-            return prompt, "move", None
+                return prompt, "move", None
         
         # Decrement all goodbye cooldowns
         for char_id in list(self.goodbye_cooldown.keys()):
@@ -678,43 +709,96 @@ Reply with ONLY: move {direction}"""
                     del self.last_talked_tick[char_id]
         
         if can_talk and nearby_chars:
-            # First, check if anyone nearby JUST said something to us - prioritize responding to them
             current_tick = int(state.get("world", {}).get("tick", 0) or 0)
             current_time = time.time()
-            speaker_to_respond_to = None
-            they_just_spoke_to_us = False
-            their_message_tick = 0
             
+            # FIRST: Check if we're already in conversation with someone
+            in_convo_with_id = None
+            in_convo_state = None
+            for char_id, state_val in self.conversation_state.items():
+                if state_val in ("waiting", "talking"):
+                    in_convo_with_id = char_id
+                    in_convo_state = state_val
+                    break
+            
+            # Check who spoke to us recently
+            speaker_to_respond_to = None
+            their_message_tick = 0
             for c in reversed(recent_convos[-10:]):
                 if c.get("listener_id") == self.char_id:
                     speaker_id = c.get("speaker_id")
                     msg_tick = int(c.get("tick", 0) or 0)
-                    # Someone spoke to us in the last 10 ticks
                     if current_tick - msg_tick <= 10:
-                        # Check if this speaker is nearby
                         for nearby in nearby_chars:
                             if nearby.get("id") == speaker_id:
                                 speaker_to_respond_to = nearby
-                                they_just_spoke_to_us = True
                                 their_message_tick = msg_tick
                                 break
                     break
             
-            # If someone just spoke to us, respond to THEM (not just the first nearby character)
-            if speaker_to_respond_to:
+            # Decide who to talk to
+            other = None
+            
+            # If we're already in conversation with someone...
+            if in_convo_with_id:
+                # Check if our conversation partner is still nearby
+                convo_partner_nearby = None
+                for nc in nearby_chars:
+                    if nc.get("id") == in_convo_with_id:
+                        convo_partner_nearby = nc
+                        break
+                
+                if convo_partner_nearby:
+                    # Continue with our existing conversation partner
+                    other = convo_partner_nearby
+                    
+                    # If someone ELSE spoke to us, we need to ignore them (we're busy)
+                    if speaker_to_respond_to and speaker_to_respond_to.get("id") != in_convo_with_id:
+                        interrupter_name = speaker_to_respond_to.get("name", "someone")
+                        print(f"   🙅 Ignoring {interrupter_name} - already in conversation with {other.get('name')}")
+                else:
+                    # Our conversation partner left - clear state and respond to new speaker
+                    print(f"   ❌ Lost sight of {in_convo_with_id[:8]}..., clearing convo state")
+                    self.conversation_state[in_convo_with_id] = "idle"
+                    self.waiting_since.pop(in_convo_with_id, None)
+                    
+                    # Now we can respond to the new speaker
+                    if speaker_to_respond_to:
+                        other = speaker_to_respond_to
+            
+            # If we're NOT in a conversation, respond to whoever spoke to us
+            elif speaker_to_respond_to:
                 other = speaker_to_respond_to
-            else:
-                # Find first nearby character NOT in cooldown AND online
-                other = None
-                current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+            
+            # If no one spoke to us and we're not in conversation, find someone to talk to
+            if other is None:
                 for nc in nearby_chars:
                     nc_id = nc.get("id", nc["name"])
+                    nc_name = nc.get("name", nc_id)
                     if nc_id in self.goodbye_cooldown:
                         continue
                     # Check if they're online (acted in last 10 ticks)
                     nc_last_action = int(nc.get("last_action_tick", 0) or 0)
                     if current_tick - nc_last_action > 10:
                         continue  # Skip offline characters
+                    
+                    # Check if they're busy with someone else
+                    nc_is_busy = False
+                    for c in reversed(recent_convos[-10:]):
+                        speaker_id = c.get("speaker_id")
+                        listener_id = c.get("listener_id")
+                        msg_tick = int(c.get("tick", 0) or 0)
+                        if current_tick - msg_tick > 8:
+                            continue  # Old message
+                        # If they spoke to someone else recently
+                        if speaker_id == nc_id and listener_id != self.char_id:
+                            nc_is_busy = True
+                            print(f"   🚶 Skipping {nc_name} - busy talking to someone else")
+                            break
+                    
+                    if nc_is_busy:
+                        continue
+                    
                     other = nc
                     break
                 
@@ -726,12 +810,67 @@ Reply with ONLY: move {direction}"""
             other_id = other.get("id", other_name)
             other_distance = other.get("distance", 10)
             
-            # No turn-taking needed - cooldowns handle conversation flow
-            # If we're here, we can talk to them (not in cooldown)
+            # Get conversation state FIRST
+            conv_state = self.conversation_state.get(other_id, "idle")
+            last_seen_from_them = self.last_seen_msg.get(other_id, 0)
+            
+            # CRITICAL: If we've never tracked this person before, check for recent messages first
+            if last_seen_from_them == 0:
+                # Check if they spoke to us recently (last 10 ticks) - don't ignore those!
+                recent_msg_from_them = 0
+                for c in recent_convos:
+                    if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
+                        msg_tick = int(c.get("tick", 0) or 0)
+                        if current_tick - msg_tick <= 10:
+                            recent_msg_from_them = msg_tick
+                            break
+                
+                if recent_msg_from_them > 0:
+                    # They spoke to us recently - set last_seen to BEFORE that message
+                    self.last_seen_msg[other_id] = recent_msg_from_them - 1
+                    last_seen_from_them = recent_msg_from_them - 1
+                    print(f"   🆕 First encounter with {other_name}, found recent message at tick {recent_msg_from_them}")
+                else:
+                    # No recent messages - ignore old ones
+                    self.last_seen_msg[other_id] = current_tick
+                    last_seen_from_them = current_tick
+                    print(f"   🆕 First encounter with {other_name}, ignoring old messages")
+            
+            # Check for NEW message from them FIRST (before distance check)
+            their_new_msg_tick = 0
+            for c in recent_convos:
+                if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
+                    msg_tick = int(c.get("tick", 0) or 0)
+                    if msg_tick > last_seen_from_them and msg_tick > their_new_msg_tick:
+                        their_new_msg_tick = msg_tick
+            
+            # If we're WAITING and they responded, transition to talking
+            if conv_state == "waiting" and their_new_msg_tick > 0:
+                print(f"   ✅ {other_name} responded at tick {their_new_msg_tick}")
+                self.last_seen_msg[other_id] = their_new_msg_tick
+                self.conversation_state[other_id] = "talking"
+                self.waiting_since.pop(other_id, None)
+                conv_state = "talking"  # Continue to conversation logic
             
             # Must be adjacent (distance <= 1.5) to talk
             if other_distance > 1.5:
-                # Too far to talk - approach them
+                # If we're WAITING for their response but they moved away, keep waiting
+                if conv_state == "waiting":
+                    wait_start = self.waiting_since.get(other_id, current_tick)
+                    ticks_waiting = current_tick - wait_start
+                    if ticks_waiting < 12:
+                        print(f"   ⏳ WAITING for {other_name}'s response ({ticks_waiting}/12 ticks) - they're at dist={other_distance:.1f}")
+                        time.sleep(3)
+                        return None, "skip", None
+                    else:
+                        # Timeout - give up
+                        print(f"   😤 TIMEOUT: {other_name} not responding (moved away)")
+                        self.conversation_state[other_id] = "idle"
+                        self.waiting_since.pop(other_id, None)
+                        self.goodbye_cooldown[other_id] = 15
+                        return None, "move", None
+                
+                # Not in conversation - approach them
                 directions = other.get("direction", valid_moves)
                 safe_directions = [d for d in directions if d in preferred_moves]
                 if not safe_directions:
@@ -742,74 +881,73 @@ Reply with ONLY: move {direction}"""
                 return None, f"direct_move_{best_direction}", None
             
             # ═══════════════════════════════════════════════════════════════
-            # STRICT CONVERSATION STATE MACHINE
-            # States: IDLE -> TALKING -> WAITING -> TALKING -> ... -> DONE
-            # Rule: NEVER speak while in WAITING state until response received
+            # CONVERSATION STATE MACHINE (continued from above)
+            # At this point: we're adjacent (dist <= 1.5) and conv_state is either
+            # "idle", "talking", or "waiting" (if no response yet)
             # ═══════════════════════════════════════════════════════════════
             
-            # Get our conversation state with this person
-            conv_state = self.conversation_state.get(other_id, "idle")
-            last_seen_from_them = self.last_seen_msg.get(other_id, 0)
-            
-            # CRITICAL: If we've never tracked this person before, initialize last_seen to NOW
-            # This prevents old messages from being treated as "new"
-            if last_seen_from_them == 0:
-                self.last_seen_msg[other_id] = current_tick
-                last_seen_from_them = current_tick
-                print(f"   🆕 First encounter with {other_name}, ignoring old messages")
-            
-            # Check for NEW message from them (tick > what we've already seen)
-            # IMPORTANT: Find the NEWEST message from them (highest tick that's new to us)
-            their_new_msg_tick = 0
-            msgs_from_them = []
-            for c in recent_convos:
-                if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
-                    msg_tick = int(c.get("tick", 0) or 0)
-                    msgs_from_them.append(msg_tick)
-                    if msg_tick > last_seen_from_them and msg_tick > their_new_msg_tick:
-                        their_new_msg_tick = msg_tick
-            
-            if conv_state == "waiting" and not their_new_msg_tick:
-                # Show what messages we DO have from them for debugging
-                if msgs_from_them:
-                    print(f"   🔍 DEBUG: Have msgs from {other_name} at ticks {msgs_from_them}, but last_seen={last_seen_from_them}")
-                else:
-                    # Check if there are ANY messages from them in recent_convos
-                    all_msgs = [(c.get("speaker_name"), c.get("listener_id"), c.get("tick")) for c in recent_convos[-5:]]
-                    print(f"   🔍 DEBUG: No msgs from {other_name} to us. Recent convos: {all_msgs}")
-            
-            other_last_action = int(other.get("last_action_tick", 0) or 0)
             print(f"   📊 State: {conv_state}, last_seen={last_seen_from_them}, new_msg={their_new_msg_tick}, now={current_tick}")
             
-            # STATE: WAITING - We sent a message, waiting for their response
+            # Check if they're busy talking to someone else
+            they_are_busy_with = None
+            for c in reversed(recent_convos[-10:]):
+                speaker_id = c.get("speaker_id")
+                listener_id = c.get("listener_id")
+                msg_tick = int(c.get("tick", 0) or 0)
+                
+                # If they spoke to someone else recently (not us)
+                if speaker_id == other_id and listener_id != self.char_id:
+                    if current_tick - msg_tick <= 8:  # Recent message
+                        they_are_busy_with = c.get("listener_name", listener_id[:8] if listener_id else "someone")
+                        break
+                # Or if someone else spoke to them recently and they responded
+                if listener_id == other_id and speaker_id != self.char_id:
+                    if current_tick - msg_tick <= 8:
+                        # Check if other_id responded to this
+                        for c2 in recent_convos:
+                            if c2.get("speaker_id") == other_id and c2.get("listener_id") == speaker_id:
+                                c2_tick = int(c2.get("tick", 0) or 0)
+                                if c2_tick > msg_tick:  # They responded
+                                    they_are_busy_with = c.get("speaker_name", speaker_id[:8] if speaker_id else "someone")
+                                    break
+                        if they_are_busy_with:
+                            break
+            
+            # STATE: WAITING - Still waiting for response (adjacent case)
             if conv_state == "waiting":
-                if their_new_msg_tick > 0:
-                    # They responded! Transition to TALKING
-                    print(f"   ✅ {other_name} responded at tick {their_new_msg_tick}")
-                    self.last_seen_msg[other_id] = their_new_msg_tick
-                    self.conversation_state[other_id] = "talking"
+                # Check if they started talking to someone else - give up
+                if they_are_busy_with:
+                    print(f"   🚶 {other_name} is busy with {they_are_busy_with}, moving on")
+                    self.conversation_state[other_id] = "idle"
                     self.waiting_since.pop(other_id, None)
-                    # Fall through to conversation logic
+                    self.goodbye_cooldown[other_id] = 15  # Short cooldown
+                    return None, "move", None
+                
+                # We already checked for their response above, so if we're here, they haven't responded
+                wait_start = self.waiting_since.get(other_id, current_tick)
+                ticks_waiting = current_tick - wait_start
+                if ticks_waiting < 12:
+                    print(f"   ⏳ WAITING for {other_name}'s response ({ticks_waiting}/12 ticks)")
+                    time.sleep(3)
+                    return None, "skip", None
                 else:
-                    # Still waiting - check timeout
-                    wait_start = self.waiting_since.get(other_id, current_tick)
-                    ticks_waiting = current_tick - wait_start
-                    if ticks_waiting < 12:
-                        print(f"   ⏳ WAITING for {other_name}'s response ({ticks_waiting}/12 ticks)")
-                        time.sleep(3)
-                        return None, "skip", None
-                    else:
-                        # Timeout - end conversation
-                        print(f"   😤 TIMEOUT: {other_name} not responding")
-                        self.conversation_state[other_id] = "idle"
-                        self.waiting_since.pop(other_id, None)
-                        self.goodbye_cooldown[other_id] = 30
-                        prompt = f"""You are {self.name}. {other_name} seems distracted.
+                    # Timeout - end conversation
+                    print(f"   😤 TIMEOUT: {other_name} not responding")
+                    self.conversation_state[other_id] = "idle"
+                    self.waiting_since.pop(other_id, None)
+                    self.goodbye_cooldown[other_id] = 30
+                    prompt = f"""You are {self.name}. {other_name} seems distracted.
 Say a brief goodbye. One sentence:"""
-                        return prompt, "goodbye", other_id
+                    return prompt, "goodbye", other_id
             
             # STATE: IDLE - Not in conversation
             elif conv_state == "idle":
+                # Before initiating, check if they're busy with someone else
+                if they_are_busy_with and their_new_msg_tick == 0:
+                    print(f"   🚶 {other_name} is busy with {they_are_busy_with}, finding someone else")
+                    # Don't initiate - find someone else or move
+                    return None, "move", None
+                
                 if their_new_msg_tick > 0:
                     # They initiated! Transition to TALKING to respond
                     print(f"   📨 {other_name} initiated at tick {their_new_msg_tick}")
@@ -820,6 +958,7 @@ Say a brief goodbye. One sentence:"""
                     # Neither talking - determine who initiates (lower ID)
                     if self.char_id > other_id:
                         # Check if they're online
+                        other_last_action = int(other.get("last_action_tick", 0) or 0)
                         if current_tick - other_last_action > 10:
                             print(f"   💤 {other_name} is offline")
                             return None, "move", None
@@ -890,17 +1029,16 @@ Reply with ONLY: move {self.traveling_direction}"""
             current_tick = int(state.get("world", {}).get("tick", 0) or 0)
             ticks_since_last_convo = current_tick - last_convo_tick if last_convo_tick > 0 else 999
             
-            # Find what they JUST said to us (check recent messages)
+            # Find what they JUST said to us (find the NEWEST message from them to us)
             last_said_to_me = None
             last_said_tick = 0
-            for c in reversed(recent_convos):
-                if c.get("listener_id") == self.char_id:
+            for c in recent_convos:  # Check all, find newest
+                if c.get("listener_id") == self.char_id and c.get("speaker_id") == other_id:
                     msg_tick = int(c.get("tick", 0) or 0)
-                    # Consider messages from the last 10 ticks
-                    if current_tick - msg_tick <= 10:
+                    # Consider messages from the last 10 ticks, keep the newest one
+                    if current_tick - msg_tick <= 10 and msg_tick > last_said_tick:
                         last_said_to_me = c.get("message")
                         last_said_tick = msg_tick
-                    break
             
             # Check if they said goodbye RECENTLY - we should acknowledge and leave too
             goodbye_phrases = ['goodbye', 'farewell', 'adieu', 'bye', 'see you', 'until next', 'take care', 'been delightful', 'bid you', 'should go', 'must go', 'heading off']
@@ -994,17 +1132,21 @@ Say goodbye warmly. Use phrases like "goodbye", "farewell", "I should go explore
             should_greet = local_exchange_count == 0 or ticks_since_we_talked > 30
             
             if should_greet:
+                personality_hint = f"\nYour personality: {self.personality[:100]}" if self.personality else ""
+                
                 if have_met_before:
                     prompt = f"""You are {self.name}. You see your friend {other_name}.
+{personality_hint}
 {memory_context}
 
-Say hi! ONE casual sentence - like meeting a friend:
+Say hi naturally! ONE casual sentence:
 
 {self.name}:"""
                 else:
                     prompt = f"""You are {self.name}. You meet {other_name} for the first time.
+{personality_hint}
 
-Introduce yourself casually in ONE sentence:
+Introduce yourself in ONE sentence - be yourself:
 
 {self.name}:"""
                 return prompt, "talk", other_id
@@ -1022,31 +1164,56 @@ Introduce yourself casually in ONE sentence:
                 # Check if they asked a question
                 asked_question = '?' in last_said_to_me
                 
-                # Show what we already said to avoid repetition
+                # Detect if we're echoing their structure
                 our_last = ""
                 for c in reversed(recent_convos):
                     if c.get("speaker_name") == self.name:
-                        our_last = c.get("message", "")[:100]
+                        our_last = c.get("message", "")
                         break
                 
-                repetition_warning = ""
+                # Check for structural echoing (both starting with same words)
+                echo_warning = ""
                 if our_last:
-                    repetition_warning = f'\n⚠️ You already said: "{our_last}..." - say something DIFFERENT!'
+                    # Get first few words of both
+                    our_start = ' '.join(our_last.split()[:4]).lower()
+                    their_start = ' '.join(last_said_to_me.split()[:4]).lower()
+                    if our_start == their_start or (our_last[:20].lower() == last_said_to_me[:20].lower()):
+                        echo_warning = "\n🚫 You've been echoing their style! Switch it up - ask a question, disagree, share a personal memory, or change the topic entirely."
+                    else:
+                        echo_warning = "\n⚠️ Don't start with the same words they used."
                 
-                prompt = f"""You are {self.name} chatting with {other_name}.
+                # Add memory context for personality
+                memory_hint = ""
+                if memory_context:
+                    memory_hint = f"\n{memory_context}"
+                
+                # Only show their LAST message, not full thread (prevents pattern-matching)
+                # Include personality to give character their own voice
+                personality_hint = f"\nYour personality: {self.personality[:150]}" if self.personality else ""
+                
+                prompt = f"""You are {self.name} talking with {other_name}.
+{personality_hint}
+{memory_hint}
+{other_name} said: "{last_said_to_me}"
+{echo_warning}
 
-They said: "{last_said_to_me[:150]}"
-{repetition_warning}
-
-Respond naturally in 1-2 sentences. Focus on THEM, not the scenery.
-{"Answer their question." if asked_question else "React to what they said or ask them something."}
+Reply in your own voice - be genuine, not performative. 1-2 sentences.
+{"Answer their question." if asked_question else "React honestly or take the conversation somewhere new."}
 
 {self.name}:"""
             else:
+                # Add memory context for personality
+                memory_hint = ""
+                if memory_context:
+                    memory_hint = f"\n{memory_context}"
+                
+                personality_hint = f"\nYour personality: {self.personality[:150]}" if self.personality else ""
+                
                 prompt = f"""You are {self.name} chatting with {other_name}.
-
-Keep the conversation going! Ask them a question or share something about yourself.
-1-2 sentences only. Focus on THEM, not surroundings.
+{personality_hint}
+{memory_hint}
+Start a new topic or ask them a genuine question. Be curious about THEM.
+1-2 sentences only.
 
 {self.name}:"""
             
@@ -1142,14 +1309,10 @@ Reply with ONLY one of: move north | move south | move east | move west"""
             # Clean up extra whitespace
             message = re.sub(r'\s+', ' ', message).strip()
             
-            # Truncate aggressively - max 2 sentences for natural dialogue
+            # Truncate to max 2 sentences for natural dialogue
             sentences = re.split(r'(?<=[.!?])\s+', message)
             if len(sentences) > 2:
                 message = ' '.join(sentences[:2])
-            
-            # Also cap by character length
-            if len(message) > 200:
-                message = message[:200].rsplit(' ', 1)[0] + '...'
             
             return "talk", {"message": message or "Hello!"}
         
@@ -1272,7 +1435,8 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     fatigue = n.get("conversationFatigue", {})
                     summaries = fatigue.get("summaries", [])
                     sum_count = len(summaries) if summaries else 0
-                    print(f"   👁️ {n['name']} (dist={n.get('distance', '?'):.1f}) cooldown={in_cooldown}({cd_remaining}) memories={sum_count}")
+                    conv_state = self.conversation_state.get(nid, "idle")
+                    print(f"   👁️ {n['name']} (dist={n.get('distance', '?'):.1f}) state={conv_state} cooldown={in_cooldown}({cd_remaining}) tick={last_action}")
                 
                 print(f"🤔 Thinking... (mode: {expected_type})")
                 
@@ -1333,6 +1497,8 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                                 
                                 if other_name:
                                     print(f"📝 Summarizing conversation ({exchange_count} exchanges)...")
+                                    # Show thought bubble on frontend
+                                    self.send_think(other_name)
                                     summary_data = self.generate_summary(
                                         other_name, 
                                         talk_target_id, 

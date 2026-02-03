@@ -821,7 +821,7 @@ Reply with ONLY: move {direction}"""
                 for c in recent_convos:
                     if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
                         msg_tick = int(c.get("tick", 0) or 0)
-                        if current_tick - msg_tick <= 10:
+                        if current_tick - msg_tick <= 15:
                             recent_msg_from_them = msg_tick
                             break
                 
@@ -831,10 +831,13 @@ Reply with ONLY: move {direction}"""
                     last_seen_from_them = recent_msg_from_them - 1
                     print(f"   🆕 First encounter with {other_name}, found recent message at tick {recent_msg_from_them}")
                 else:
-                    # No recent messages - ignore old ones
-                    self.last_seen_msg[other_id] = current_tick
-                    last_seen_from_them = current_tick
-                    print(f"   🆕 First encounter with {other_name}, ignoring old messages")
+                    # No recent messages found - but don't be too aggressive!
+                    # Set last_seen to 15 ticks ago so we can still catch messages
+                    # that might arrive due to race conditions
+                    safe_last_seen = max(0, current_tick - 15)
+                    self.last_seen_msg[other_id] = safe_last_seen
+                    last_seen_from_them = safe_last_seen
+                    print(f"   🆕 First encounter with {other_name}, watching for messages since tick {safe_last_seen}")
             
             # Check for NEW message from them FIRST (before distance check)
             their_new_msg_tick = 0
@@ -963,24 +966,40 @@ Say a brief goodbye. One sentence:"""
                             print(f"   💤 {other_name} is offline")
                             return None, "move", None
                         
-                        # Wait for them to initiate (with timeout)
-                        init_key = f"init_{other_id}"
-                        wait_start = self.waiting_since.get(init_key, 0)
-                        if wait_start == 0:
-                            self.waiting_since[init_key] = current_tick
-                            print(f"   ⏳ Letting {other_name} initiate (lower ID) - tick 1/6")
-                            time.sleep(2)
-                            return None, "skip", None
-                        elif current_tick - wait_start < 6:
-                            print(f"   ⏳ Letting {other_name} initiate ({current_tick - wait_start}/6 ticks)")
-                            time.sleep(2)
-                            return None, "skip", None
+                        # Before waiting, do a fresh check for their message
+                        # (handles race condition where message arrived after our state fetch)
+                        for c in recent_convos:
+                            if c.get("speaker_id") == other_id and c.get("listener_id") == self.char_id:
+                                msg_tick = int(c.get("tick", 0) or 0)
+                                if current_tick - msg_tick <= 10:  # Recent message
+                                    print(f"   📨 {other_name} already initiated at tick {msg_tick}")
+                                    self.last_seen_msg[other_id] = msg_tick
+                                    self.conversation_state[other_id] = "talking"
+                                    their_new_msg_tick = msg_tick  # For conversation logic below
+                                    break
+                        
+                        # If we found their message, skip the waiting logic
+                        if self.conversation_state.get(other_id) == "talking":
+                            pass  # Fall through to conversation logic
                         else:
-                            # Timeout - we initiate instead
-                            print(f"   🗣️ Initiating (waited {current_tick - wait_start} ticks)")
-                            self.waiting_since.pop(init_key, None)
-                            self.conversation_state[other_id] = "talking"
-                            # Fall through to conversation logic
+                            # Wait for them to initiate (with timeout)
+                            init_key = f"init_{other_id}"
+                            wait_start = self.waiting_since.get(init_key, 0)
+                            if wait_start == 0:
+                                self.waiting_since[init_key] = current_tick
+                                print(f"   ⏳ Letting {other_name} initiate (lower ID) - tick 1/6")
+                                time.sleep(2)
+                                return None, "skip", None
+                            elif current_tick - wait_start < 6:
+                                print(f"   ⏳ Letting {other_name} initiate ({current_tick - wait_start}/6 ticks)")
+                                time.sleep(2)
+                                return None, "skip", None
+                            else:
+                                # Timeout - we initiate instead
+                                print(f"   🗣️ Initiating (waited {current_tick - wait_start} ticks)")
+                                self.waiting_since.pop(init_key, None)
+                                self.conversation_state[other_id] = "talking"
+                                # Fall through to conversation logic
                     else:
                         # We have lower ID - we initiate
                         print(f"   🗣️ Initiating (we have lower ID)")
@@ -1440,6 +1459,9 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 
                 print(f"🤔 Thinking... (mode: {expected_type})")
                 
+                # Initialize for state tracking
+                pending_state_change = None
+                
                 # Handle direct actions (no LLM needed)
                 if prompt is None and expected_type == "skip":
                     # Waiting for response - skip this turn
@@ -1464,18 +1486,14 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     message = params["message"]
                     is_goodbye = params.get("is_goodbye", False)
                     
-                    # STATE MACHINE: After speaking, transition to WAITING
+                    # Note: Don't change state yet - wait for server confirmation
+                    # We'll update state after we know the action succeeded
                     if talk_target_id:
                         current_tick = int(state.get("world", {}).get("tick", 0) or 0)
                         if is_goodbye:
-                            # End of conversation - back to IDLE
-                            self.conversation_state[talk_target_id] = "idle"
-                            self.waiting_since.pop(talk_target_id, None)
-                            self.last_seen_msg.pop(talk_target_id, None)
+                            pending_state_change = "goodbye"
                         else:
-                            # Transition to WAITING for their response
-                            self.conversation_state[talk_target_id] = "waiting"
-                            self.waiting_since[talk_target_id] = current_tick
+                            pending_state_change = "waiting"
                     
                     if is_goodbye:
                         print(f'👋 "{message}"')
@@ -1549,6 +1567,19 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         # Server rejected talk - we should move away
                         self.must_leave = True
                         self.leaving_from = talk_target_id
+                    if result.get('consecutiveLimit'):
+                        # Server says wait for response - stay in talking state to retry
+                        print(f"   ⏳ Waiting for their response...")
+                        if talk_target_id:
+                            self.conversation_state[talk_target_id] = "talking"
+                    if result.get('rateLimited'):
+                        print(f"   ⏳ Rate limited, slowing down...")
+                        time.sleep(2)  # Extra delay on rate limit
+                    if result.get('goodbyeCooldown'):
+                        # Server says we're in goodbye cooldown - set local cooldown
+                        if talk_target_id:
+                            self.goodbye_cooldown[talk_target_id] = result.get('ticksLeft', 25)
+                            print(f"   🚶 Goodbye cooldown - find someone else")
                     
                     # Track blocked move directions
                     if action == "move" and "blocks" in result.get('error', '').lower():
@@ -1572,6 +1603,17 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                         print(f"   ⚡ Energy: {result['energy']}")
                     if result.get('hunger') is not None:
                         print(f"   🍖 Hunger: {result['hunger']}")
+                    
+                    # NOW apply state change since action succeeded
+                    if action == "talk" and talk_target_id and pending_state_change:
+                        current_tick = int(state.get("world", {}).get("tick", 0) or 0)
+                        if pending_state_change == "goodbye":
+                            self.conversation_state[talk_target_id] = "idle"
+                            self.waiting_since.pop(talk_target_id, None)
+                            self.last_seen_msg.pop(talk_target_id, None)
+                        else:
+                            self.conversation_state[talk_target_id] = "waiting"
+                            self.waiting_since[talk_target_id] = current_tick
                     
                     history_entry = {
                         "turn": turn,

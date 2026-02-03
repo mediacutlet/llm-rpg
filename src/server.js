@@ -193,35 +193,58 @@ async function checkConsecutiveMessages(speakerId, listenerId, currentTick) {
 }
 
 // Update consecutive message tracking
+// IMPORTANT: Must update BOTH directions since relationships are directional
 async function updateMessageTracking(speakerId, listenerId, currentTick) {
-  // Check if relationship exists
-  const existing = await pool.query(`
+  // Update speaker → listener direction
+  const existing1 = await pool.query(`
     SELECT last_speaker_id FROM relationships 
     WHERE char1_id = $1 AND char2_id = $2
   `, [speakerId, listenerId]);
   
-  if (existing.rows.length === 0) {
-    // Will be created by the main talk handler
-    return;
+  if (existing1.rows.length > 0) {
+    const lastSpeaker = existing1.rows[0].last_speaker_id;
+    if (lastSpeaker === speakerId) {
+      // Same speaker, increment consecutive count
+      await pool.query(`
+        UPDATE relationships 
+        SET consecutive_count = COALESCE(consecutive_count, 0) + 1,
+            last_message_tick = $3
+        WHERE char1_id = $1 AND char2_id = $2
+      `, [speakerId, listenerId, currentTick]);
+    } else {
+      // Different speaker, reset count
+      await pool.query(`
+        UPDATE relationships 
+        SET last_speaker_id = $1, consecutive_count = 1, last_message_tick = $3
+        WHERE char1_id = $1 AND char2_id = $2
+      `, [speakerId, listenerId, currentTick]);
+    }
   }
   
-  const lastSpeaker = existing.rows[0].last_speaker_id;
+  // ALSO update listener → speaker direction (so listener's check knows speaker just talked)
+  const existing2 = await pool.query(`
+    SELECT last_speaker_id FROM relationships 
+    WHERE char1_id = $1 AND char2_id = $2
+  `, [listenerId, speakerId]);
   
-  if (lastSpeaker === speakerId) {
-    // Same speaker, increment consecutive count
-    await pool.query(`
-      UPDATE relationships 
-      SET consecutive_count = COALESCE(consecutive_count, 0) + 1,
-          last_message_tick = $3
-      WHERE char1_id = $1 AND char2_id = $2
-    `, [speakerId, listenerId, currentTick]);
-  } else {
-    // Different speaker, reset count
-    await pool.query(`
-      UPDATE relationships 
-      SET last_speaker_id = $1, consecutive_count = 1, last_message_tick = $4
-      WHERE char1_id = $2 AND char2_id = $3
-    `, [speakerId, speakerId, listenerId, currentTick]);
+  if (existing2.rows.length > 0) {
+    const lastSpeaker = existing2.rows[0].last_speaker_id;
+    if (lastSpeaker === speakerId) {
+      // Same speaker, increment consecutive count
+      await pool.query(`
+        UPDATE relationships 
+        SET consecutive_count = COALESCE(consecutive_count, 0) + 1,
+            last_message_tick = $3
+        WHERE char1_id = $1 AND char2_id = $2
+      `, [listenerId, speakerId, currentTick]);
+    } else {
+      // Different speaker (the current speaker), reset count
+      await pool.query(`
+        UPDATE relationships 
+        SET last_speaker_id = $1, consecutive_count = 1, last_message_tick = $3
+        WHERE char1_id = $2 AND char2_id = $1
+      `, [speakerId, listenerId, currentTick]);
+    }
   }
 }
 

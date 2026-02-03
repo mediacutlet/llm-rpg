@@ -688,6 +688,34 @@ Keep exploring! Go {direction.upper()}.
 Reply with ONLY: move {direction}"""
                 return prompt, "move", None
         
+        # PRIORITY 6: Portal travel - if standing on a portal
+        current_portal = state.get("currentPortal")
+        nearby_portals = state.get("nearbyPortals", [])
+        zone = state.get("zone", {})
+        
+        if current_portal and not (can_talk and nearby_chars):
+            # Standing on a portal with no one to talk to
+            dest_name = current_portal.get("destinationName", "unknown")
+            portal_name = current_portal.get("name", "portal")
+            
+            # Higher chance to travel if we've been exploring
+            travel_chance = 0.4 if self.traveling_turns > 0 else 0.25
+            
+            if random.random() < travel_chance:
+                print(f"   🚪 Traveling through {portal_name} to {dest_name}!")
+                return None, "travel", None
+        
+        # PRIORITY 7: Move toward nearby portals occasionally (exploration)
+        if nearby_portals and not nearby_chars and not current_portal:
+            closest_portal = nearby_portals[0]
+            if closest_portal.get("distance", 100) < 8 and random.random() < 0.15:
+                # Move toward the portal
+                directions = closest_portal.get("direction", valid_moves)
+                if directions:
+                    direction = directions[0] if isinstance(directions, list) else directions
+                    print(f"   🧭 Curious about {closest_portal.get('name')} to {closest_portal.get('destination_name')}...")
+                    return None, f"direct_move_{direction}", None
+        
         # Decrement all goodbye cooldowns
         for char_id in list(self.goodbye_cooldown.keys()):
             self.goodbye_cooldown[char_id] -= 1
@@ -1133,11 +1161,28 @@ Say goodbye back warmly. One short sentence - use "goodbye", "farewell", or "tak
             have_met_before = server_exchanges > 0 or len(recent_convos) > 0 or len(past_summaries) > 0
             
             # Build memory context from past summaries
+            # Use LAST 3 (most recent) + up to 3 RANDOM older ones
             memory_context = ""
             if past_summaries:
-                memory_context = "\n📚 YOUR SHARED HISTORY WITH " + other_name.upper() + ":\n"
-                for s in past_summaries[-3:]:  # Last 3 summaries
+                recent_memories = past_summaries[-3:] if len(past_summaries) >= 3 else past_summaries
+                older_memories = past_summaries[:-3] if len(past_summaries) > 3 else []
+                
+                # Pick up to 3 random older memories
+                random_older = random.sample(older_memories, min(3, len(older_memories))) if older_memories else []
+                
+                memory_context = f"\n📚 YOUR SHARED HISTORY WITH {other_name.upper()} ({len(past_summaries)} memories total):\n"
+                
+                if random_older:
+                    memory_context += "  [From the past...]\n"
+                    for s in random_older:
+                        memory_context += f'  • "{s.get("title", "Past conversation")}": {s.get("summary", "")}\n'
+                    memory_context += "  [More recently...]\n"
+                
+                for s in recent_memories:
                     memory_context += f'  • "{s.get("title", "Past conversation")}": {s.get("summary", "")}\n'
+                
+                # Debug: show memory stats
+                print(f"   📚 Loaded {len(recent_memories)} recent + {len(random_older)} random older = {len(recent_memories) + len(random_older)}/{len(past_summaries)} memories with {other_name}")
             
             # After 8 local exchanges, say goodbye
             if local_exchange_count >= 8:
@@ -1203,8 +1248,13 @@ Introduce yourself in ONE sentence - be yourself:
                 
                 # Add memory context for personality
                 memory_hint = ""
+                memory_prompt_addition = ""
                 if memory_context:
                     memory_hint = f"\n{memory_context}"
+                    # Occasionally suggest referencing an old memory
+                    if past_summaries and len(past_summaries) > 3 and random.random() < 0.3:
+                        random_memory = random.choice(past_summaries[:-3])
+                        memory_prompt_addition = f'\n💡 Maybe reference your shared memory: "{random_memory.get("title", "something from the past")}"'
                 
                 # Only show their LAST message, not full thread (prevents pattern-matching)
                 # Include personality to give character their own voice
@@ -1214,7 +1264,7 @@ Introduce yourself in ONE sentence - be yourself:
 {personality_hint}
 {memory_hint}
 {other_name} said: "{last_said_to_me}"
-{echo_warning}
+{echo_warning}{memory_prompt_addition}
 
 Reply in your own voice - be genuine, not performative. 1-2 sentences.
 {"Answer their question." if asked_question else "React honestly or take the conversation somewhere new."}
@@ -1223,15 +1273,20 @@ Reply in your own voice - be genuine, not performative. 1-2 sentences.
             else:
                 # Add memory context for personality
                 memory_hint = ""
+                memory_prompt_addition = ""
                 if memory_context:
                     memory_hint = f"\n{memory_context}"
+                    # Occasionally suggest referencing an old memory
+                    if past_summaries and len(past_summaries) > 3 and random.random() < 0.3:
+                        random_memory = random.choice(past_summaries[:-3])
+                        memory_prompt_addition = f'\n💡 Maybe bring up your shared memory: "{random_memory.get("title", "something from the past")}"'
                 
                 personality_hint = f"\nYour personality: {self.personality[:150]}" if self.personality else ""
                 
                 prompt = f"""You are {self.name} chatting with {other_name}.
 {personality_hint}
 {memory_hint}
-Start a new topic or ask them a genuine question. Be curious about THEM.
+Start a new topic or ask them a genuine question. Be curious about THEM.{memory_prompt_addition}
 1-2 sentences only.
 
 {self.name}:"""
@@ -1418,14 +1473,25 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 hunger = char.get('hunger', 100)
                 is_night = state.get('world', {}).get('isNight', False)
                 
+                # Zone info
+                zone = state.get('zone', {})
+                zone_name = zone.get('name', 'Unknown')
+                zone_safe = zone.get('isSafe', True)
+                current_portal = state.get('currentPortal')
+                
                 print(f"\n{'═' * 50}")
                 time_icon = '🌙' if is_night else '☀️'
+                zone_icon = '🏠' if zone_safe else '⚔️'
                 print(f"Turn {turn} │ Tick {state.get('world', {}).get('tick', '?')} {time_icon} │ "
                       f"L{char.get('level')} │ "
                       f"HP {char.get('hp')}/{char.get('max_hp')} │ "
                       f"XP {char.get('xp')} │ "
                       f"⚡{energy} │ 🍖{hunger}")
-                print(f"Position: {current_pos}")
+                print(f"Position: {current_pos} │ {zone_icon} {zone_name}")
+                
+                # Show portal if standing on one
+                if current_portal:
+                    print(f"   🚪 Portal: {current_portal.get('name')} → {current_portal.get('destinationName')}")
                 
                 # Show who's nearby (only online characters)
                 nearby = state.get('nearbyCharacters', [])
@@ -1434,6 +1500,12 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                 if online_nearby:
                     names = [f"{c.get('emoji','')} {c['name']}" for c in online_nearby[:3]]
                     print(f"Nearby: {', '.join(names)}")
+                
+                # Show nearby portals
+                nearby_portals = state.get('nearbyPortals', [])
+                if nearby_portals and not current_portal:
+                    portal_info = [f"{p.get('emoji','')} {p.get('name')} ({p.get('distance', 0):.0f} tiles)" for p in nearby_portals[:2]]
+                    print(f"Portals: {', '.join(portal_info)}")
                 
                 print(f"{'─' * 50}")
                 
@@ -1477,10 +1549,33 @@ Reply with ONLY one of: move north | move south | move east | move west"""
                     # Keep eating - no LLM call needed
                     action, params = "interact", {"target": "market"}
                     response = "[eating at market]"
+                elif prompt is None and expected_type == "travel":
+                    # Travel through portal - no LLM call needed
+                    action, params = "travel", {}
+                    response = "[traveling through portal]"
                 else:
                     response = ollama_generate(prompt, self.model)
                     # Parse and execute
                     action, params = self.parse_response(response, expected_type)
+                
+                if action == "travel":
+                    # Traveling to a new zone
+                    current_portal = state.get("currentPortal", {})
+                    dest_name = current_portal.get("destinationName", "unknown")
+                    print(f"🚪 Traveling to {dest_name}...")
+                    result = self.act("travel")
+                    
+                    if "error" in result:
+                        print(f"❌ {result['error']}")
+                    else:
+                        new_zone = result.get("newZoneName", "unknown")
+                        print(f"✨ Arrived in {new_zone}!")
+                        # Reset traveling state since we're in a new area
+                        self.traveling_turns = 0
+                        self.traveling_direction = None
+                    
+                    time.sleep(POLL_INTERVAL)
+                    continue
                 
                 if action == "talk":
                     message = params["message"]

@@ -283,6 +283,56 @@
       text-align: left;
     }
     .join-cta a { color: #3498db; }
+    
+    /* Zone tabs */
+    .zone-tabs {
+      display: flex;
+      gap: 5px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .zone-tab {
+      padding: 8px 16px;
+      background: rgba(255,255,255,0.1);
+      border: none;
+      border-radius: 8px;
+      color: #aaa;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: all 0.2s;
+    }
+    .zone-tab:hover {
+      background: rgba(255,255,255,0.2);
+      color: #fff;
+    }
+    .zone-tab.active {
+      background: linear-gradient(135deg, #3498db, #9b59b6);
+      color: #fff;
+    }
+    .zone-tab .danger {
+      font-size: 0.7rem;
+      opacity: 0.7;
+    }
+    .zone-info {
+      font-size: 0.85rem;
+      color: #888;
+      margin-bottom: 10px;
+      padding: 8px;
+      background: rgba(0,0,0,0.2);
+      border-radius: 5px;
+    }
+    .zone-info .safe { color: #2ecc71; }
+    .zone-info .dangerous { color: #e74c3c; }
+    
+    /* Portal cells */
+    .cell.portal {
+      background: linear-gradient(135deg, rgba(155, 89, 182, 0.4), rgba(52, 152, 219, 0.4)) !important;
+      animation: portal-pulse 2s ease-in-out infinite;
+    }
+    @keyframes portal-pulse {
+      0%, 100% { box-shadow: inset 0 0 5px rgba(155, 89, 182, 0.5); }
+      50% { box-shadow: inset 0 0 15px rgba(155, 89, 182, 0.8); }
+    }
   </style>
 </head>
 <body>
@@ -303,7 +353,11 @@
   <div class="container">
     <div class="main-area">
       <div class="panel world-container">
-        <h2>🗺️ The Meadow</h2>
+        <div class="zone-tabs" id="zoneTabs">
+          <!-- Zone tabs will be populated by JS -->
+        </div>
+        <h2 id="zoneTitle">🗺️ The Meadow</h2>
+        <div class="zone-info" id="zoneInfo"></div>
         <div class="world-grid" id="worldGrid"></div>
       </div>
       
@@ -338,11 +392,13 @@
   <script>
     let worldData = null;
     let eventSource = null;
+    let selectedZone = 'meadow';  // Default zone
     
     async function fetchWorld() {
       try {
         const res = await fetch('/api/world');
         worldData = await res.json();
+        renderZoneTabs();
         renderWorld();
         renderLeaderboard();
         renderConversations();
@@ -353,9 +409,59 @@
       }
     }
     
+    function renderZoneTabs() {
+      const tabs = document.getElementById('zoneTabs');
+      if (!worldData.zones || worldData.zones.length === 0) {
+        tabs.innerHTML = '';
+        return;
+      }
+      
+      const zoneEmojis = {
+        'meadow': '🌸',
+        'dark_forest': '🌲',
+        'caves': '💎',
+        'ruins': '🏛️'
+      };
+      
+      tabs.innerHTML = worldData.zones.map(z => {
+        const emoji = zoneEmojis[z.id] || '🗺️';
+        const charCount = worldData.characters.filter(c => c.current_zone === z.id).length;
+        const dangerStars = z.danger_level > 0 ? `<span class="danger">${'⚔️'.repeat(Math.min(z.danger_level, 3))}</span>` : '<span class="danger">🏠</span>';
+        return `<button class="zone-tab ${z.id === selectedZone ? 'active' : ''}" onclick="selectZone('${z.id}')">
+          ${emoji} ${z.name} ${charCount > 0 ? `(${charCount})` : ''} ${dangerStars}
+        </button>`;
+      }).join('');
+    }
+    
+    function selectZone(zoneId) {
+      selectedZone = zoneId;
+      renderZoneTabs();
+      renderWorld();
+    }
+    
     function renderWorld() {
       const grid = document.getElementById('worldGrid');
-      const { width, height } = worldData.world;
+      const zoneTitle = document.getElementById('zoneTitle');
+      const zoneInfo = document.getElementById('zoneInfo');
+      
+      // Find selected zone
+      const zone = worldData.zones?.find(z => z.id === selectedZone) || { 
+        id: 'meadow', name: 'The Meadow', width: 20, height: 15, 
+        is_safe: true, danger_level: 0, description: 'A peaceful meadow.' 
+      };
+      
+      const width = zone.width || worldData.world.width;
+      const height = zone.height || worldData.world.height;
+      
+      // Update zone title
+      const zoneEmojis = { 'meadow': '🌸', 'dark_forest': '🌲', 'caves': '💎', 'ruins': '🏛️' };
+      zoneTitle.textContent = `${zoneEmojis[zone.id] || '🗺️'} ${zone.name}`;
+      
+      // Zone info
+      const safetyClass = zone.is_safe ? 'safe' : 'dangerous';
+      const safetyText = zone.is_safe ? '🏠 Safe Zone' : `⚔️ Danger Level ${zone.danger_level}`;
+      const charCount = worldData.characters.filter(c => c.current_zone === selectedZone).length;
+      zoneInfo.innerHTML = `<span class="${safetyClass}">${safetyText}</span> | ${charCount} character${charCount !== 1 ? 's' : ''} here | ${zone.description || ''}`;
       
       grid.style.gridTemplateColumns = `repeat(${width}, 32px)`;
       grid.innerHTML = '';
@@ -372,16 +478,34 @@
         }
       }
       
-      for (const obj of worldData.objects) {
-        const idx = obj.y * width + obj.x;
+      // Add portals (zone connections)
+      const portals = worldData.zoneConnections?.filter(c => c.from_zone === selectedZone) || [];
+      for (const portal of portals) {
+        const idx = portal.from_y * width + portal.from_x;
         if (cells[idx]) {
+          cells[idx].classList.add('portal');
+          cells[idx].innerHTML = `<span title="${portal.name} → ${portal.destination_name}">${portal.emoji}</span>`;
+        }
+      }
+      
+      // Filter objects by zone
+      const zoneObjects = worldData.objects.filter(o => 
+        o.zone_id === selectedZone || (!o.zone_id && selectedZone === 'meadow')
+      );
+      
+      for (const obj of zoneObjects) {
+        const idx = obj.y * width + obj.x;
+        if (cells[idx] && !cells[idx].classList.contains('portal')) {
           cells[idx].innerHTML = `<span title="${obj.name}">${obj.emoji}</span>`;
           if (obj.blocking) cells[idx].classList.add('blocking');
         }
       }
       
+      // Filter characters by zone
+      const zoneChars = worldData.characters.filter(c => c.current_zone === selectedZone);
+      
       const charPositions = {};
-      for (const char of worldData.characters) {
+      for (const char of zoneChars) {
         const key = `${char.x},${char.y}`;
         if (!charPositions[key]) charPositions[key] = [];
         charPositions[key].push(char);
@@ -593,6 +717,18 @@
             char.thinking = false;
             renderWorld();
           }, 5000);
+        }
+      });
+      
+      eventSource.addEventListener('travel', (e) => {
+        const data = JSON.parse(e.data);
+        const char = worldData.characters.find(c => c.id === data.id);
+        if (char) {
+          char.x = data.newX;
+          char.y = data.newY;
+          char.current_zone = data.toZone;
+          renderZoneTabs();
+          renderWorld();
         }
       });
     }

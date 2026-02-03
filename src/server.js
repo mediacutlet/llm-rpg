@@ -630,19 +630,38 @@ app.get('/api/me', async (req, res) => {
 // Get world state (public - for viewer)
 app.get('/api/world', async (req, res) => {
   try {
+    const { zone: requestedZone } = req.query;
     const world = await pool.query('SELECT * FROM world WHERE id = 1');
     const currentTick = world.rows[0]?.tick || 0;
+    
+    // Get all zones
+    const zones = await pool.query('SELECT * FROM zones ORDER BY danger_level');
+    
+    // Get zone connections
+    const connections = await pool.query(`
+      SELECT zc.*, z.name as destination_name 
+      FROM zone_connections zc
+      JOIN zones z ON zc.to_zone = z.id
+    `);
     
     // Only show characters who acted in the last 15 ticks (online)
     const characters = await pool.query(`
       SELECT id, name, emoji, x, y, hp, max_hp, xp, level, is_active, 
-             turn_interval, last_action_tick, created_at,
+             turn_interval, last_action_tick, created_at, current_zone,
              COALESCE(energy, 100) as energy, COALESCE(max_energy, 100) as max_energy
       FROM characters 
       WHERE is_active = true AND last_action_tick > $1 - 15
       ORDER BY xp DESC
     `, [currentTick]);
-    const objects = await pool.query('SELECT * FROM objects');
+    
+    // Get objects (optionally filter by zone)
+    let objects;
+    if (requestedZone) {
+      objects = await pool.query('SELECT * FROM objects WHERE zone_id = $1 OR zone_id IS NULL', [requestedZone]);
+    } else {
+      objects = await pool.query('SELECT * FROM objects');
+    }
+    
     const recentConvos = await pool.query(`
       SELECT c.*, 
              s.name as speaker_name, s.emoji as speaker_emoji,
@@ -661,6 +680,8 @@ app.get('/api/world', async (req, res) => {
     
     res.json({
       world: world.rows[0],
+      zones: zones.rows,
+      zoneConnections: connections.rows,
       characters: characters.rows,
       objects: objects.rows,
       conversations: recentConvos.rows,
@@ -790,8 +811,16 @@ app.get('/api/look/:charId', async (req, res) => {
     }
     
     const me = char.rows[0];
+    const currentZone = me.current_zone || 'meadow';
+    
+    // Get zone info
+    const zoneResult = await pool.query('SELECT * FROM zones WHERE id = $1', [currentZone]);
+    const zone = zoneResult.rows[0] || { id: 'meadow', name: 'The Meadow', width: 20, height: 15, is_safe: true, danger_level: 0 };
+    
     const world = await pool.query('SELECT * FROM world WHERE id = 1');
-    const { width, height, tick, is_night, day_length, night_length } = world.rows[0];
+    const { tick, is_night, day_length, night_length } = world.rows[0];
+    const width = zone.width;
+    const height = zone.height;
     const isNight = is_night || false;
     
     // Get conversation fatigue info for nearby characters
@@ -809,19 +838,29 @@ app.get('/api/look/:charId', async (req, res) => {
       };
     });
     
-    // Get nearby characters (within 10 tiles)
+    // Get nearby characters (within 10 tiles, SAME ZONE)
     const others = await pool.query(`
-      SELECT id, name, emoji, x, y, hp, xp, level, last_action_tick
+      SELECT id, name, emoji, x, y, hp, xp, level, last_action_tick, current_zone
       FROM characters
       WHERE id != $1 AND is_active = true
+        AND current_zone = $4
         AND ABS(x - $2) <= 10 AND ABS(y - $3) <= 10
-    `, [charId, me.x, me.y]);
+    `, [charId, me.x, me.y, currentZone]);
     
-    // Get nearby objects (within 5 tiles)
+    // Get nearby objects (within 6 tiles, SAME ZONE)
     const objects = await pool.query(`
       SELECT * FROM objects
-      WHERE ABS(x - $1) <= 6 AND ABS(y - $2) <= 6
-    `, [me.x, me.y]);
+      WHERE (zone_id = $3 OR zone_id IS NULL)
+        AND ABS(x - $1) <= 6 AND ABS(y - $2) <= 6
+    `, [me.x, me.y, currentZone]);
+    
+    // Get zone connections (portals) in this zone
+    const portals = await pool.query(`
+      SELECT zc.*, z.name as destination_name, z.danger_level as destination_danger
+      FROM zone_connections zc
+      JOIN zones z ON zc.to_zone = z.id
+      WHERE zc.from_zone = $1
+    `, [currentZone]);
     
     // Get recent memories
     const memories = await pool.query(`
@@ -964,9 +1003,18 @@ app.get('/api/look/:charId', async (req, res) => {
       direction: getMoveToward(r.x - me.x, r.y - me.y)
     }));
     
+    // Find nearby portals (zone connections)
+    const nearbyPortals = portals.rows.map(p => ({
+      ...p,
+      distance: getDistance(me.x, me.y, p.from_x, p.from_y),
+      direction: getMoveToward(p.from_x - me.x, p.from_y - me.y)
+    })).filter(p => p.distance <= 10).sort((a, b) => a.distance - b.distance);
+    
     // Get current tile info
     const currentTile = objects.rows.find(o => o.x === me.x && o.y === me.y);
-    const currentLocation = currentTile ? currentTile.name : 'open meadow';
+    const currentPortal = portals.rows.find(p => p.from_x === me.x && p.from_y === me.y);
+    const currentLocation = currentPortal ? `${currentPortal.name} (to ${currentPortal.destination_name})` : 
+                           (currentTile ? currentTile.name : (zone.name || 'open area'));
     
     // Get recent world events (last 5 ticks)
     const worldTick = world.rows[0]?.tick || 0;
@@ -977,14 +1025,32 @@ app.get('/api/look/:charId', async (req, res) => {
     `, [worldTick]);
     
     res.json({
-      character: { ...me, energy, maxEnergy, hunger, maxHunger },
+      character: { ...me, energy, maxEnergy, hunger, maxHunger, currentZone },
       world: { ...world.rows[0], isNight },
+      zone: {
+        id: zone.id,
+        name: zone.name,
+        description: zone.description,
+        width: zone.width,
+        height: zone.height,
+        isSafe: zone.is_safe,
+        dangerLevel: zone.danger_level,
+        ambient: zone.ambient_description
+      },
       currentLocation,
+      currentPortal: currentPortal ? {
+        name: currentPortal.name,
+        emoji: currentPortal.emoji,
+        destination: currentPortal.to_zone,
+        destinationName: currentPortal.destination_name,
+        description: currentPortal.description
+      } : null,
       nearbyCharacters: nearbyChars.map(c => ({
         ...c,
         conversationFatigue: fatigueMap[c.id] || { exchanges: 0, cooldownUntil: 0, summaries: [] }
       })),
       nearbyObjects: nearbyObjs,
+      nearbyPortals,
       restSpotsNearby: restSpots,
       foodSpotsNearby: foodSpots,
       recentWorldEvents: recentEvents.rows.map(e => e.message),
@@ -1032,7 +1098,14 @@ app.post('/api/action/:charId', async (req, res) => {
     }
     
     const world = await pool.query('SELECT * FROM world WHERE id = 1');
-    const { width, height, tick } = world.rows[0];
+    const { tick } = world.rows[0];
+    
+    // Get current zone dimensions
+    const currentZone = me.current_zone || 'meadow';
+    const zoneResult = await pool.query('SELECT * FROM zones WHERE id = $1', [currentZone]);
+    const zone = zoneResult.rows[0] || { width: 20, height: 15 };
+    const width = zone.width;
+    const height = zone.height;
     
     let result = { success: false };
     
@@ -1057,15 +1130,15 @@ app.post('/api/action/:charId', async (req, res) => {
         const newX = me.x + delta[0];
         const newY = me.y + delta[1];
         
-        // Boundary check
+        // Boundary check (using zone dimensions)
         if (newX < 0 || newX >= width || newY < 0 || newY >= height) {
-          return res.status(400).json({ error: 'Cannot move there - edge of world' });
+          return res.status(400).json({ error: `Cannot move there - edge of ${zone.name || 'zone'}` });
         }
         
-        // Blocking object check
+        // Blocking object check (in same zone)
         const blocking = await pool.query(
-          'SELECT * FROM objects WHERE x = $1 AND y = $2 AND blocking = true',
-          [newX, newY]
+          'SELECT * FROM objects WHERE x = $1 AND y = $2 AND blocking = true AND (zone_id = $3 OR zone_id IS NULL)',
+          [newX, newY, currentZone]
         );
         if (blocking.rows.length > 0) {
           return res.status(400).json({ error: `${blocking.rows[0].name} blocks your path` });
@@ -1471,6 +1544,75 @@ app.post('/api/action/:charId', async (req, res) => {
         broadcast('think', { id: charId, name: me.name, emoji: me.emoji, about: thinkingAbout });
         
         result = { success: true, thinking: true };
+        break;
+      }
+      
+      case 'travel': {
+        // Travel to another zone via a portal
+        const currentZone = me.current_zone || 'meadow';
+        
+        // Check if there's a portal at current position
+        const portal = await pool.query(`
+          SELECT zc.*, z.name as destination_name, z.width as dest_width, z.height as dest_height,
+                 z.is_safe as dest_safe, z.danger_level as dest_danger
+          FROM zone_connections zc
+          JOIN zones z ON zc.to_zone = z.id
+          WHERE zc.from_zone = $1 AND zc.from_x = $2 AND zc.from_y = $3
+        `, [currentZone, me.x, me.y]);
+        
+        if (portal.rows.length === 0) {
+          return res.status(400).json({ 
+            error: 'No portal here. Move to a zone connection to travel.',
+            noPortal: true
+          });
+        }
+        
+        const p = portal.rows[0];
+        
+        // Move character to new zone
+        await pool.query(`
+          UPDATE characters 
+          SET current_zone = $1, x = $2, y = $3 
+          WHERE id = $4
+        `, [p.to_zone, p.to_x, p.to_y, charId]);
+        
+        // Log the travel
+        const msg = `${me.name} travels from ${currentZone} to ${p.to_zone} via ${p.name}`;
+        await pool.query(
+          'INSERT INTO activity_log (tick, character_id, action, message) VALUES ($1, $2, $3, $4)',
+          [tick, charId, 'travel', msg]
+        );
+        
+        // Add memory of the journey
+        await pool.query(
+          'INSERT INTO memories (character_id, tick, content) VALUES ($1, $2, $3)',
+          [charId, tick, `I traveled to ${p.destination_name} through the ${p.name}. ${p.description || ''}`]
+        );
+        
+        // Award XP for exploration
+        await awardXp(charId, 15, 'travel');
+        
+        broadcast('travel', { 
+          id: charId, 
+          name: me.name, 
+          emoji: me.emoji,
+          fromZone: currentZone,
+          toZone: p.to_zone,
+          toZoneName: p.destination_name,
+          portal: p.name,
+          newX: p.to_x,
+          newY: p.to_y
+        });
+        
+        result = { 
+          success: true, 
+          message: msg,
+          newZone: p.to_zone,
+          newZoneName: p.destination_name,
+          newPosition: { x: p.to_x, y: p.to_y },
+          isSafe: p.dest_safe,
+          dangerLevel: p.dest_danger
+        };
         break;
       }
       
